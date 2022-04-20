@@ -1,0 +1,8 @@
+{
+    "sites": {
+        "google.com": {
+            "/": 200,
+            "/search?q=stardust": 200
+        }
+    }
+}
