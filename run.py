@@ -30,7 +30,7 @@ def do_heartbeat_check(sites):
                 + str(sites["sites"][site][check])
             )
             try:
-                r = requests.get("https://" + str(site) + str(check))
+                r = requests.get("https://" + str(site) + str(check), timeout=10)
             except (Exception):
                 print("endpoint seems to be unreachable, response code is 0")
                 ALERTS.append(
