@@ -64,37 +64,32 @@ def do_heartbeat_check(sites):
     print("do_heartbeat_check ended")
 
 
-def check_for_alerts():
-    print("check_for_alerts started")
-    if ALERTS:
-        html_body = ""
-        print("alerts exist, forming html next")
-        for alert in ALERTS:
-            html_body += (
-                "<strong>Site:</strong> " + str(alert["alert"]["site"]) + " <br>"
-            )
-            html_body += (
-                "<strong>Endpoint:</strong> "
-                + str(alert["alert"]["endpoint"])
-                + " <br>"
-            )
-            html_body += (
-                "<strong>Response Code:</strong> "
-                + str(alert["alert"]["received"])
-                + " <br>"
-            )
-            html_body += "<br>"
-        print("send_urgent_email called")
-        print(send_urgent_email(html_body))
+def get_email_markup():
+    print("get_email_markup started")
+
+    html_body = ""
+    for alert in ALERTS:
+        html_body += "<strong>Site:</strong> " + str(alert["alert"]["site"]) + " <br>"
+        html_body += (
+            "<strong>Endpoint:</strong> " + str(alert["alert"]["endpoint"]) + " <br>"
+        )
+        html_body += (
+            "<strong>Response Code:</strong> "
+            + str(alert["alert"]["received"])
+            + " <br>"
+        )
+        html_body += "<br>"
+    return html_body
 
 
-def send_urgent_email(html_body):
+def send_urgent_email(html_body, failure_count=0):
     print("send_urgent_email started")
     print("pulling email template")
     html_template = open(os.path.join(scriptdir, "email-content.html"))
     html_template = html_template.read()
     print("replacing variables in the template")
     html_template = str(html_template).replace("{{replace_alerts}}", html_body)
+    html_template = str(html_template).replace("{{failure_count}}", str(failure_count))
     print("posting request to mailgun")
     return requests.post(
         "https://api.mailgun.net/v3/"
@@ -110,6 +105,19 @@ def send_urgent_email(html_body):
     )
 
 
+def get_failed_count():
+    with open(os.path.join(scriptdir, "tracking.json")) as tracking_file:
+        current_json_tracking = json.loads(tracking_file.read())
+        tracking_file.close()
+    return int(current_json_tracking.get("failed_count"))
+
+
+def set_failed_count(count=0):
+    with open(os.path.join(scriptdir, "tracking.json"), "w+") as tracking_file:
+        tracking_file.write(json.dumps({"failed_count": count}))
+        tracking_file.close()
+
+
 if __name__ == "__main__":
     print("Pulling data from config.ini")
     PARSER.read("config.ini")
@@ -118,4 +126,28 @@ if __name__ == "__main__":
     print(get_website_dictionary())
 
     do_heartbeat_check(get_website_dictionary())
-    check_for_alerts()
+    if ALERTS:
+        print("get_email_markup called")
+
+        # if 5 fails back to back, then clearly it's an issue
+        print("get_failed_count called")
+        count_fails = get_failed_count()
+        count_fails = int(count_fails) + 1
+        set_failed_count(count_fails)
+        markup = get_email_markup()
+        if count_fails >= 5:
+            print("send_urgent_email called")
+            send_urgent_email(markup, count_fails)
+    else:
+        count_fails = get_failed_count()
+
+        # if we resolved, but count is something high, lets reset to 5
+        # and for each time theres no alerts, lets deduct that number to 0
+        print("failure counter is currently at " + str(count_fails))
+        if count_fails > 5:
+            set_failed_count(5)
+            print("seems to be fixed, resetting counter to 5")
+            print("it should be decrease the failure count now")
+        elif count_fails > 0:
+            set_failed_count(int(count_fails) - 1)
+            print("decreasing failure count")
