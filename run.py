@@ -9,7 +9,6 @@ scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
 
 ALERTS = []
-SEQUENCE = 0
 PARSER = configparser.ConfigParser()
 
 
@@ -28,7 +27,6 @@ async def do_check(sites, site, check):
         + str(sites["sites"][site][check])
     )
     try:
-        SEQUENCE += 1
         r = requests.get("https://" + str(site) + str(check), timeout=10)
     except Exception as ex:
         print("endpoint seems to be unreachable, response code is 0")
