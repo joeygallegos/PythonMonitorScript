@@ -30,8 +30,9 @@ async def do_check(sites, site, check):
     try:
         SEQUENCE += 1
         r = requests.get("https://" + str(site) + str(check), timeout=10)
-    except (Exception):
+    except Exception as ex:
         print("endpoint seems to be unreachable, response code is 0")
+        print("exception: " + str(ex))
         ALERTS.append(
             {
                 "alert": {
@@ -39,6 +40,7 @@ async def do_check(sites, site, check):
                     "endpoint": check,
                     "expected": int(sites["sites"][site][check]),
                     "received": 0,
+                    "exception": ex,
                 }
             }
         )
