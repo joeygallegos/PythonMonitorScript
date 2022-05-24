@@ -3,11 +3,13 @@ import json
 import requests
 import configparser
 import os
+import asyncio
 
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
 
 ALERTS = []
+SEQUENCE = 0
 PARSER = configparser.ConfigParser()
 
 
@@ -17,50 +19,58 @@ def get_website_dictionary():
     return sites_to_monitor
 
 
+async def do_check(sites, site, check):
+    print("do_check started")
+    print(
+        "checking endpoint "
+        + str(check)
+        + " for a status code "
+        + str(sites["sites"][site][check])
+    )
+    try:
+        SEQUENCE += 1
+        r = requests.get("https://" + str(site) + str(check), timeout=10)
+    except (Exception):
+        print("endpoint seems to be unreachable, response code is 0")
+        ALERTS.append(
+            {
+                "alert": {
+                    "site": site,
+                    "endpoint": check,
+                    "expected": int(sites["sites"][site][check]),
+                    "received": 0,
+                }
+            }
+        )
+    else:
+        if r.status_code != int(sites["sites"][site][check]):
+            print(
+                "response code not "
+                + str(sites["sites"][site][check])
+                + ".. received "
+                + str(r.status_code)
+            )
+            ALERTS.append(
+                {
+                    "alert": {
+                        "site": site,
+                        "endpoint": check,
+                        "expected": int(sites["sites"][site][check]),
+                        "received": r.status_code,
+                    }
+                }
+            )
+
+
 def do_heartbeat_check(sites):
     print("do_heartbeat_check started")
+    loop = asyncio.get_event_loop()
     for site in sites["sites"]:
         print("----")
         print("starting heartbeat check for " + site)
         for check in sites["sites"][site]:
-            print(
-                "checking endpoint "
-                + str(check)
-                + " for a status code "
-                + str(sites["sites"][site][check])
-            )
-            try:
-                r = requests.get("https://" + str(site) + str(check), timeout=10)
-            except (Exception):
-                print("endpoint seems to be unreachable, response code is 0")
-                ALERTS.append(
-                    {
-                        "alert": {
-                            "site": site,
-                            "endpoint": check,
-                            "expected": int(sites["sites"][site][check]),
-                            "received": 0,
-                        }
-                    }
-                )
-            else:
-                if r.status_code != int(sites["sites"][site][check]):
-                    print(
-                        "response code not "
-                        + str(sites["sites"][site][check])
-                        + ".. received "
-                        + str(r.status_code)
-                    )
-                    ALERTS.append(
-                        {
-                            "alert": {
-                                "site": site,
-                                "endpoint": check,
-                                "expected": int(sites["sites"][site][check]),
-                                "received": r.status_code,
-                            }
-                        }
-                    )
+            loop.run_until_complete(do_check(sites, site, check))
+
     print("do_heartbeat_check ended")
 
 
