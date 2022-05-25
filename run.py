@@ -88,6 +88,12 @@ def get_email_markup():
             + str(alert["alert"]["received"])
             + " <br>"
         )
+        if alert["alert"]["exception"]:
+            html_body += (
+                "<strong>Exception:</strong> "
+                + str(alert["alert"]["exception"])
+                + " <br>"
+            )
         html_body += "<br>"
     return html_body
 
