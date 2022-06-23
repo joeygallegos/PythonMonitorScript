@@ -1,8 +1,11 @@
 {
     "sites": {
         "google.com": {
-            "/": 200,
-            "/search?q=stardust": 200
+            "check": true,
+            "endpoints":
+                "/": 200,
+                "/search?q=stardust": 200
+            }
         }
     }
 }

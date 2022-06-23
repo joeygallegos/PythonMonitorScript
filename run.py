@@ -18,16 +18,16 @@ def get_website_dictionary():
     return sites_to_monitor
 
 
-async def do_check(sites, site, check):
-    print("do_check started")
+async def do_endpoint_check(sites, site, endpoint):
+    print("do_endpoint_check started")
     print(
         "checking endpoint "
-        + str(check)
+        + str(endpoint)
         + " for a status code "
-        + str(sites["sites"][site][check])
+        + str(sites["sites"][site]["endpoints"][endpoint])
     )
     try:
-        r = requests.get("https://" + str(site) + str(check), timeout=10)
+        r = requests.get("https://" + str(site) + str(endpoint), timeout=10)
     except Exception as ex:
         print("endpoint seems to be unreachable, response code is 0")
         print("exception: " + str(ex))
@@ -35,18 +35,18 @@ async def do_check(sites, site, check):
             {
                 "alert": {
                     "site": site,
-                    "endpoint": check,
-                    "expected": int(sites["sites"][site][check]),
+                    "endpoint": endpoint,
+                    "expected": int(sites["sites"][site]["endpoints"][endpoint]),
                     "received": 0,
                     "exception": ex,
                 }
             }
         )
     else:
-        if r.status_code != int(sites["sites"][site][check]):
+        if r.status_code != int(sites["sites"][site]["endpoints"][endpoint]):
             print(
                 "response code not "
-                + str(sites["sites"][site][check])
+                + str(sites["sites"][site]["endpoints"][endpoint])
                 + ".. received "
                 + str(r.status_code)
             )
@@ -54,8 +54,8 @@ async def do_check(sites, site, check):
                 {
                     "alert": {
                         "site": site,
-                        "endpoint": check,
-                        "expected": int(sites["sites"][site][check]),
+                        "endpoint": endpoint,
+                        "expected": int(sites["sites"][site]["endpoints"][endpoint]),
                         "received": r.status_code,
                     }
                 }
@@ -66,10 +66,14 @@ def do_heartbeat_check(sites):
     print("do_heartbeat_check started")
     loop = asyncio.get_event_loop()
     for site in sites["sites"]:
-        print("----")
-        print("starting heartbeat check for " + site)
-        for check in sites["sites"][site]:
-            loop.run_until_complete(do_check(sites, site, check))
+        should_check = sites["sites"][site]["check"]
+        if should_check:
+            print("----")
+            print("starting heartbeat check for " + site)
+            for endpoint in sites["sites"][site]["endpoints"]:
+                loop.run_until_complete(do_endpoint_check(sites, site, endpoint))
+        else:
+            print("check variable set to false for " + site)
 
     print("do_heartbeat_check ended")
 
