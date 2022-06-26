@@ -2,7 +2,7 @@
     "sites": {
         "google.com": {
             "check": true,
-            "endpoints":
+            "endpoints": {
                 "/": 200,
                 "/search?q=stardust": 200
             }
