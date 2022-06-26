@@ -3,7 +3,9 @@ import json
 import requests
 import configparser
 import os
+
 import asyncio
+import aiohttp
 
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
@@ -27,7 +29,27 @@ async def do_endpoint_check(sites, site, endpoint):
         + str(sites["sites"][site]["endpoints"][endpoint])
     )
     try:
-        r = requests.get("https://" + str(site) + str(endpoint), timeout=10)
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://" + str(site) + str(endpoint)) as response:
+                if response.status != int(sites["sites"][site]["endpoints"][endpoint]):
+                    print(
+                        "response code not "
+                        + str(sites["sites"][site]["endpoints"][endpoint])
+                        + ".. received "
+                        + str(response.status)
+                    )
+                    ALERTS.append(
+                        {
+                            "alert": {
+                                "site": site,
+                                "endpoint": endpoint,
+                                "expected": int(
+                                    sites["sites"][site]["endpoints"][endpoint]
+                                ),
+                                "received": response.status,
+                            }
+                        }
+                    )
     except Exception as ex:
         print("endpoint seems to be unreachable, response code is 0")
         print("exception: " + str(ex))
@@ -42,24 +64,6 @@ async def do_endpoint_check(sites, site, endpoint):
                 }
             }
         )
-    else:
-        if r.status_code != int(sites["sites"][site]["endpoints"][endpoint]):
-            print(
-                "response code not "
-                + str(sites["sites"][site]["endpoints"][endpoint])
-                + ".. received "
-                + str(r.status_code)
-            )
-            ALERTS.append(
-                {
-                    "alert": {
-                        "site": site,
-                        "endpoint": endpoint,
-                        "expected": int(sites["sites"][site]["endpoints"][endpoint]),
-                        "received": r.status_code,
-                    }
-                }
-            )
 
 
 def do_heartbeat_check(sites):
