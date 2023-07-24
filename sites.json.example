@@ -3,8 +3,14 @@
         "google.com": {
             "check": true,
             "endpoints": {
-                "/": 200,
-                "/search?q=stardust": 200
+                "/": {
+                    "status": 200,
+                    "dom_contains": "Google"
+                },
+                "/.well-known/security.txt": {
+                    "status": 200,
+                    "dom_contains": "security@google.com"
+                }
             }
         }
     }
