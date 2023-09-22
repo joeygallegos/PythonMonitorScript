@@ -30,8 +30,12 @@ async def do_endpoint_check(sites, site, endpoint):
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
     )
     try:
+        # set timeout for whole request
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://" + str(site) + str(endpoint)) as response:
+            async with session.get(
+                "https://" + str(site) + str(endpoint), timeout=timeout
+            ) as response:
                 # Extract the response body as a string
                 response_body = await response.text()
 
@@ -85,8 +89,11 @@ async def do_endpoint_check(sites, site, endpoint):
                             }
                         )
     except Exception as ex:
+        message = str(ex)
+        if not message:
+            message = "Unreachable, response code is 0"
         print("endpoint seems to be unreachable, response code is 0")
-        print("exception: " + str(ex))
+        print("exception: " + str(message))
         ALERTS.append(
             {
                 "alert": {
