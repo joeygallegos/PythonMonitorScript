@@ -326,7 +326,7 @@ if __name__ == "__main__":
                 get_email_markup(),
                 next_fail_ticks,
                 get_pretty_time(datetime.fromisoformat(get_incident_start_timestamp())),
-                get_incident_start_timestamp,
+                get_incident_start_timestamp(),
             )
 
     else:
