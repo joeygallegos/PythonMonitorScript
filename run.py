@@ -32,9 +32,17 @@ async def do_endpoint_check(sites, site, endpoint):
     try:
         # set timeout for whole request
         timeout = aiohttp.ClientTimeout(total=5)
+
+        # specify the User-Agent header
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 PythonMonitorScript/1.0",
+            "Accept": "*/*",
+            "Connection": "close",
+        }
+
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://" + str(site) + str(endpoint), timeout=timeout
+                "https://" + str(site) + str(endpoint), timeout=timeout, headers=headers
             ) as response:
                 # Extract the response body as a string
                 response_body = await response.text()
@@ -207,18 +215,26 @@ def write_data_to_manifest(new_data):
 
 # get failed ticks from file storage
 def get_failed_ticks():
-    with open(os.path.join(scriptdir, "tracking.json")) as tracking_file:
-        current_json_tracking = json.loads(tracking_file.read())
-        tracking_file.close()
-    return int(current_json_tracking.get("failed_count"))
+    tracking_file_path = os.path.join(scriptdir, "tracking.json")
+
+    try:
+        with open(tracking_file_path) as tracking_file:
+            current_json_tracking = json.load(tracking_file)
+            failed_ticks = int(current_json_tracking.get("failed_count", 0))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        # Handle file not found, JSON decode error, or invalid value gracefully
+        print(f"Error reading tracking file: {e}")
+        failed_ticks = 0
+
+    return max(0, failed_ticks)
 
 
 # manipulate manifest array and trigger a write to the manifest file
 def set_failed_ticks(count=0):
-    print("get object data from read_data_from_manifest()")
+    print("set_failed_ticks: get object data from read_data_from_manifest()")
     tmp_data = read_data_from_manifest()
 
-    print("replace entry with new count")
+    print("set_failed_ticks: replace entry with new count")
     tmp_data["failed_count"] = count
 
     write_data_to_manifest(tmp_data)
@@ -226,15 +242,9 @@ def set_failed_ticks(count=0):
 
 # manipulate manifest array and trigger a write to the manifest file
 def set_incident_start_timestamp(new_timestamp=str):
-    print("trying to set incident start timestamp to: " + str(datetime.now()))
-    tmp_data = read_data_from_manifest()
-
-    print("replace entry with new timestamp")
-
-    # NOTE!!! can be null also
-    tmp_data["incident_start_timestamp"] = new_timestamp
-
-    write_data_to_manifest(tmp_data)
+    json_data = read_data_from_manifest()
+    json_data["incident_start_timestamp"] = new_timestamp
+    write_data_to_manifest(json_data)
 
 
 def get_incident_start_timestamp():
