@@ -202,15 +202,13 @@ def read_data_from_manifest():
 # write JSON object to the file
 def write_data_to_manifest(new_data):
     try:
-        print("opening tracking.json with w+")
-        with open(os.path.join(scriptdir, "tracking.json"), "w+") as tracking_file:
-            # // json.dumps() returns a string and not a json object
-            print("write tracking.json")
-            tracking_file.write(json.dumps(new_data))
-            print("close tracking.json")
-            tracking_file.close()
+        manifest_path = os.path.join(scriptdir, "tracking.json")
+
+        with open(manifest_path, "w") as tracking_file:
+            json.dump(new_data, tracking_file, indent=2)
+
     except Exception as ex:
-        print("write_data_to_manifest exception: " + str(ex))
+        print("write_data_to_manifest exception:", ex)
 
 
 # get failed ticks from file storage
@@ -229,15 +227,15 @@ def get_failed_ticks():
     return max(0, failed_ticks)
 
 
-# manipulate manifest array and trigger a write to the manifest file
+#  write failed_count to the manifest file
 def set_failed_ticks(count=0):
-    print("set_failed_ticks: get object data from read_data_from_manifest()")
-    tmp_data = read_data_from_manifest()
+    # get object data from read_data_from_manifest()
+    manifest_tmp_data = read_data_from_manifest()
 
-    print("set_failed_ticks: replace entry with new count")
-    tmp_data["failed_count"] = count
+    # replace entry with new count
+    manifest_tmp_data["failed_count"] = count
 
-    write_data_to_manifest(tmp_data)
+    write_data_to_manifest(manifest_tmp_data)
 
 
 # manipulate manifest array and trigger a write to the manifest file
@@ -301,7 +299,7 @@ def get_pretty_time(then, now=datetime.now(), interval="default"):
 
 
 if __name__ == "__main__":
-    print("Pulling data from config.ini")
+    print("Reading data from config.ini")
     PARSER.read("config.ini")
 
     # trigger checks for each site and associated endpoints
@@ -345,11 +343,12 @@ if __name__ == "__main__":
         # if the issue is resolved, but count is something very high
         # then lets reset the tracking ticks to 5
         # and for each time theres no alerts, lets subtract 1 until that number is 0
-        print("failure counter is currently at " + str(count_fails))
+        print("Failure counter is currently at " + str(count_fails))
         if count_fails > 5:
             set_failed_ticks(5)
-            print("issue seems to be resolved, resetting counter to 5")
-            print("script will now incrementally decrease the failure count down to 0")
+            print("Incident seems to be resolved...")
+            print(" - Resetting counter to 5")
+            print(" - Incrementally decreasing the failure count down to 0")
 
         # if there are no alerts but count is still positive value, then decrease count by 1
         elif count_fails > 0:
