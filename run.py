@@ -3,23 +3,46 @@ import json
 import requests
 import configparser
 import os
-
+import time
+import uuid
 import asyncio
 import aiohttp
 
 from datetime import datetime
+from selenium import webdriver
 
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
 
 ALERTS = []
 PARSER = configparser.ConfigParser()
+BROWSER = None
+SCREENSHOTS = []
 
 
 def get_website_dictionary():
     sites_config_file = open(os.path.join(scriptdir, "sites.json"))
     sites_to_monitor = json.load(sites_config_file)
     return sites_to_monitor
+
+
+def take_screenshot(nonce=str, endpoint=str):
+    path = PARSER.get("DEFAULT", "TMP_PATH_SCREENSHOTS")
+
+    # Filename based on path and nonce
+    filename = f"{path}/screenshot_{nonce}.png"
+
+    try:
+        BROWSER.get(endpoint)
+        time.sleep(2)  # Adjust the sleep duration based on your requirements
+
+        BROWSER.save_screenshot(filename)
+        SCREENSHOTS.append((nonce, filename))
+    except Exception as e:
+        print(f"Error accessing {endpoint}: {e}")
+        BROWSER.save_screenshot(filename)
+        SCREENSHOTS.append((nonce, filename))
+        # TODO: Handle the error as needed, e.g., log it or take alternative action
 
 
 async def do_endpoint_check(sites, site, endpoint):
@@ -29,6 +52,8 @@ async def do_endpoint_check(sites, site, endpoint):
         + " for a status code "
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
     )
+    # Setup the nonce for this test
+    nonce = str(uuid.uuid4().int)[:16]
     try:
         # set timeout for whole request
         timeout = aiohttp.ClientTimeout(total=5)
@@ -68,9 +93,11 @@ async def do_endpoint_check(sites, site, endpoint):
                                 ),
                                 "received": response.status,
                                 "exception": "Status code mismatch",
+                                "nonce": nonce,
                             }
                         }
                     )
+                    take_screenshot(nonce, "https://" + str(site) + str(endpoint))
                 # if sites config has "dom_contains" string value, then check if that string is in the response text
                 search_key = sites["sites"][site]["endpoints"][endpoint]["dom_contains"]
 
@@ -93,28 +120,32 @@ async def do_endpoint_check(sites, site, endpoint):
                                     "expected": 0,
                                     "received": 0,
                                     "exception": "DOM string mismatch",
+                                    "nonce": nonce,
                                 }
                             }
                         )
+                        take_screenshot(nonce, "https://" + str(site) + str(endpoint))
     except Exception as ex:
         message = str(ex)
         if not message:
             message = "Unreachable, response code is 0"
-        print("endpoint seems to be unreachable, response code is 0")
-        print("exception: " + str(message))
-        ALERTS.append(
-            {
-                "alert": {
-                    "site": site,
-                    "endpoint": endpoint,
-                    "expected": int(
-                        sites["sites"][site]["endpoints"][endpoint]["status"]
-                    ),
-                    "received": 0,
-                    "exception": ex,
+            print("endpoint seems to be unreachable, response code is 0")
+            print("exception: " + str(message))
+            ALERTS.append(
+                {
+                    "alert": {
+                        "site": site,
+                        "endpoint": endpoint,
+                        "expected": int(
+                            sites["sites"][site]["endpoints"][endpoint]["status"]
+                        ),
+                        "received": 0,
+                        "exception": ex,
+                        "nonce": nonce,
+                    }
                 }
-            }
-        )
+            )
+            take_screenshot(nonce, "https://" + str(site) + str(endpoint))
 
 
 def do_heartbeat_check(sites):
@@ -147,12 +178,23 @@ def get_email_markup():
             + str(alert["alert"]["received"])
             + " <br>"
         )
+
         if alert["alert"]["exception"]:
             html_body += (
                 "<strong>Exception:</strong> "
                 + str(alert["alert"]["exception"])
                 + " <br>"
             )
+
+        # Debug nonce
+        html_body += "<strong>Nonce:</strong> " + str(alert["alert"]["nonce"]) + " <br>"
+
+        # Inline pictures from Selenium
+        html_body += (
+            "<strong>Screenshot:</strong><br><img src='cid:"
+            + str(alert["alert"]["nonce"])
+            + ".png' alt='Nonce Image'>"
+        )
         html_body += "<br>"
     return html_body
 
@@ -177,12 +219,25 @@ def send_urgent_email(
         "{{incident_start_timestamp_pretty}}",
         str(incident_start_timestamp),
     )
+
+    files = []
+    for nonce, filename in SCREENSHOTS:
+        try:
+            with open(filename, "rb") as screenshot_file:
+                file_content = screenshot_file.read()
+                files.append(("inline", (f"{nonce}.png", file_content)))
+        except FileNotFoundError:
+            print(f"File not found: {filename}")
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
+
     print("posting request to mailgun")
     return requests.post(
         "https://api.mailgun.net/v3/"
         + PARSER.get("DEFAULT", "MAILGUN_DOMAIN")
         + "/messages",
         auth=("api", PARSER.get("DEFAULT", "MAILGUN_PRIVATE_KEY")),
+        files=files,
         data={
             "from": PARSER.get("DEFAULT", "MAILGUN_FROM"),
             "to": [PARSER.get("DEFAULT", "ALERTS_EMAIL")],
@@ -302,6 +357,20 @@ if __name__ == "__main__":
     print("Reading data from config.ini")
     PARSER.read("config.ini")
 
+    # Set up options for browser headless mode
+    options = webdriver.ChromeOptions()
+
+    is_debug = PARSER.getboolean("DEFAULT", "DEBUG")
+    if is_debug is False:
+        options.add_argument("--headless")
+
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    # Initialize the WebDriver with the options
+    BROWSER = webdriver.Chrome(options=options)
+
     # trigger checks for each site and associated endpoints
     do_heartbeat_check(get_website_dictionary())
 
@@ -359,3 +428,17 @@ if __name__ == "__main__":
         if count_fails == 0:
             set_incident_start_timestamp(None)
             print("All clear")
+
+    # Cleanup the running browser
+    BROWSER.quit()
+
+    # Cleanup delete the screenshot files
+    if SCREENSHOTS:
+        for nonce, filename in SCREENSHOTS:
+            try:
+                os.remove(filename)
+                print(f"Deleted: {filename}")
+            except FileNotFoundError:
+                print(f"File not found: {filename}")
+            except Exception as e:
+                print(f"Error deleting {filename}: {e}")
