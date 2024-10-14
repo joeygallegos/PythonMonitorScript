@@ -7,6 +7,8 @@ import time
 import uuid
 import asyncio
 import aiohttp
+import sys
+from multidict import CIMultiDictProxy
 
 from datetime import datetime
 from selenium import webdriver
@@ -18,6 +20,8 @@ ALERTS = []
 PARSER = configparser.ConfigParser()
 BROWSER = None
 SCREENSHOTS = []
+SHOW_HEADERS = "--show-headers" in sys.argv
+TAKE_SCREENSHOT = "--take-screenshot" in sys.argv
 
 
 def get_website_dictionary():
@@ -26,7 +30,7 @@ def get_website_dictionary():
     return sites_to_monitor
 
 
-def take_screenshot(nonce=str, endpoint=str):
+def take_endpoint_screenshot(nonce=str, endpoint=str):
     path = PARSER.get("DEFAULT", "TMP_PATH_SCREENSHOTS")
 
     # Filename based on path and nonce
@@ -94,10 +98,16 @@ async def do_endpoint_check(sites, site, endpoint):
                                 "received": response.status,
                                 "exception": "Status code mismatch",
                                 "nonce": nonce,
+                                "body": response_body,
+                                "headers": response.headers,
                             }
                         }
                     )
-                    take_screenshot(nonce, "https://" + str(site) + str(endpoint))
+
+                    if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
+                        take_endpoint_screenshot(
+                            nonce, "https://" + str(site) + str(endpoint)
+                        )
                 # if sites config has "dom_contains" string value, then check if that string is in the response text
                 search_key = sites["sites"][site]["endpoints"][endpoint]["dom_contains"]
 
@@ -121,10 +131,15 @@ async def do_endpoint_check(sites, site, endpoint):
                                     "received": 0,
                                     "exception": "DOM string mismatch",
                                     "nonce": nonce,
+                                    "body": response_body,
+                                    "headers": response.headers,
                                 }
                             }
                         )
-                        take_screenshot(nonce, "https://" + str(site) + str(endpoint))
+                        if TAKE_SCREENSHOT:
+                            take_endpoint_screenshot(
+                                nonce, "https://" + str(site) + str(endpoint)
+                            )
     except Exception as ex:
         message = str(ex)
         if not message:
@@ -142,10 +157,13 @@ async def do_endpoint_check(sites, site, endpoint):
                         "received": 0,
                         "exception": ex,
                         "nonce": nonce,
+                        "body": None,
+                        "headers": None,
                     }
                 }
             )
-            take_screenshot(nonce, "https://" + str(site) + str(endpoint))
+            if TAKE_SCREENSHOT:
+                take_endpoint_screenshot(nonce, "https://" + str(site) + str(endpoint))
 
 
 def do_heartbeat_check(sites):
@@ -164,38 +182,79 @@ def do_heartbeat_check(sites):
     print("do_heartbeat_check ended")
 
 
+# Function to get the number of checks (endpoints) for a given site
+def get_num_of_checks(site_name):
+    # Check if the site exists in the config
+    domains = get_website_dictionary()["sites"]
+    if site_name in domains:
+        # Return the number of endpoints (checks) for the given site
+        return len(domains[site_name]["endpoints"])
+    else:
+        # If site does not exist in config, return 0 or a message
+        return 0  # Or return an error message if preferred
+
+
 def get_email_markup():
     print("get_email_markup started")
 
     html_body = ""
-    for alert in ALERTS:
-        html_body += "<strong>Site:</strong> " + str(alert["alert"]["site"]) + " <br>"
-        html_body += (
-            "<strong>Endpoint:</strong> " + str(alert["alert"]["endpoint"]) + " <br>"
-        )
-        html_body += (
-            "<strong>Response Code:</strong> "
-            + str(alert["alert"]["received"])
-            + " <br>"
-        )
 
-        if alert["alert"]["exception"]:
+    # Step 1: Group the alerts by "site"
+    grouped_alerts = {}
+    for alert in ALERTS:
+        site = alert["alert"]["site"]
+        if site not in grouped_alerts:
+            grouped_alerts[site] = []
+        grouped_alerts[site].append(alert)
+
+    # Step 2: Iterate through the grouped alerts
+    for site, alerts in grouped_alerts.items():
+        # Count the number of failed checks
+        failed_checks = len(alerts)
+
+        # Get the total number of checks for the domain (from config)
+        total_checks_for_domain = get_num_of_checks(site)
+
+        # Header message
+        html_body += f"<span style='color: #dc818f;'>{failed_checks} of {total_checks_for_domain} checks failed for {site}</span><br>"
+
+        # Step 3: Loop through each alert for this site
+        for alert in alerts:
+            html_body += f"<strong>Endpoint:</strong> {alert['alert']['endpoint']} <br>"
             html_body += (
-                "<strong>Exception:</strong> "
-                + str(alert["alert"]["exception"])
-                + " <br>"
+                f"<strong>Response Code:</strong> {alert['alert']['received']} <br>"
             )
 
-        # Debug nonce
-        html_body += "<strong>Nonce:</strong> " + str(alert["alert"]["nonce"]) + " <br>"
+            if alert["alert"]["exception"]:
+                html_body += (
+                    f"<strong>Exception:</strong> {alert['alert']['exception']} <br>"
+                )
 
-        # Inline pictures from Selenium
-        html_body += (
-            "<strong>Screenshot:</strong><br><img src='cid:"
-            + str(alert["alert"]["nonce"])
-            + ".png' alt='Nonce Image'>"
-        )
-        html_body += "<br>"
+            # Debug nonce
+            html_body += f"<strong>Nonce:</strong> {alert['alert']['nonce']} <br>"
+
+            if SCREENSHOTS_ENABLED is True:
+                # Inline pictures from Selenium using the nonce as part of the image CID
+                html_body += f"<strong>Screenshot:</strong><br><img src='cid:{alert['alert']['nonce']}.png' alt='Nonce Image'><br>"
+
+            # Optionally, add headers if they exist
+            if SHOW_HEADERS:
+                if alert["alert"]["headers"] and isinstance(
+                    alert["alert"]["headers"], CIMultiDictProxy
+                ):
+                    html_body += "<strong>Headers:</strong><br>"
+                    header_data = alert["alert"]["headers"]
+                    for key, value in header_data.items():
+                        html_body += f"- <strong><i>{key}:</i></strong> {value} <br>"
+
+                if alert["alert"]["body"]:
+                    html_body += (
+                        f"<strong>Body:</strong> {str(alert['alert']['body'])} <br>"
+                    )
+            html_body += "<br>"
+        # Optionally, add a separator for each site's alerts
+        html_body += "<hr><br>"
+
     return html_body
 
 
@@ -356,6 +415,7 @@ def get_pretty_time(then, now=datetime.now(), interval="default"):
 if __name__ == "__main__":
     print("Reading data from config.ini")
     PARSER.read("config.ini")
+    SCREENSHOTS_ENABLED = PARSER.getboolean("DEFAULT", "SCREENSHOTS_ENABLED")
 
     # Set up options for browser headless mode
     options = webdriver.ChromeOptions()
@@ -387,6 +447,7 @@ if __name__ == "__main__":
             set_incident_start_timestamp(str(datetime.now()))
 
         # if 5 fails back to back, then clearly it's an issue
+        print("if 5 fails back to back, then clearly it's an issue")
         if next_fail_ticks >= 5 and next_fail_ticks < 30:
             print("Sending an alert to emails")
             send_urgent_email(
@@ -405,6 +466,8 @@ if __name__ == "__main__":
                 get_pretty_time(datetime.fromisoformat(get_incident_start_timestamp())),
                 get_incident_start_timestamp(),
             )
+        else:
+            print("skipped notification, greater than 30")
 
     else:
         count_fails = get_failed_ticks()
