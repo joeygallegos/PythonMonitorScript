@@ -429,7 +429,8 @@ if __name__ == "__main__":
     )
 
     # Initialize the WebDriver with the options
-    BROWSER = webdriver.Chrome(options=options)
+    if SCREENSHOTS_ENABLED:
+        BROWSER = webdriver.Chrome(options=options)
 
     # trigger checks for each site and associated endpoints
     do_heartbeat_check(get_website_dictionary())
@@ -493,10 +494,11 @@ if __name__ == "__main__":
             print("All clear")
 
     # Cleanup the running browser
-    BROWSER.quit()
+    if SCREENSHOTS_ENABLED:
+        BROWSER.quit()
 
     # Cleanup delete the screenshot files
-    if SCREENSHOTS:
+    if SCREENSHOTS_ENABLED and SCREENSHOTS:
         for nonce, filename in SCREENSHOTS:
             try:
                 os.remove(filename)
