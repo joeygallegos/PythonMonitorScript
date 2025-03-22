@@ -441,14 +441,6 @@ if __name__ == "__main__":
         next_fail_ticks = int(current_fail_ticks) + 1
         set_failed_ticks(next_fail_ticks)
 
-        # if we detect our first fail, then set the incident start time
-        print("Checking if we need to set the incident start time")
-        if next_fail_ticks >= 1 and get_incident_start_timestamp() == "None":
-            print("Setting the incident start time since >= 1")
-            set_incident_start_timestamp(str(datetime.now()))
-
-        # if 5 fails back to back, then clearly it's an issue
-        print("if 5 fails back to back, then clearly it's an issue")
         if next_fail_ticks >= 5 and next_fail_ticks < 30:
             print("Sending an alert to emails")
             send_urgent_email(
@@ -457,9 +449,7 @@ if __name__ == "__main__":
                 get_pretty_time(datetime.fromisoformat(get_incident_start_timestamp())),
                 get_incident_start_timestamp(),
             )
-
-        # if more than 30 fails back to back, then only alert once every 15 failed ticks
-        if next_fail_ticks >= 30 and next_fail_ticks % 15 == 0:
+        elif next_fail_ticks >= 30 and next_fail_ticks % 15 == 0:
             print("Sending an alert to emails")
             send_urgent_email(
                 get_email_markup(),
@@ -468,7 +458,7 @@ if __name__ == "__main__":
                 get_incident_start_timestamp(),
             )
         else:
-            print("skipped notification, greater than 30")
+            print(f"Skipped notification, greater than 30: next_fail_ticks={next_fail_ticks}")
 
     else:
         count_fails = get_failed_ticks()
