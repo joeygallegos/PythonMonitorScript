@@ -4,4 +4,8 @@ This was created so I could make sure certain websites are online and reactively
 
 I have this running in a Linux server running Ubuntu, on a cronjob which runs every 1 minute. The endpoint scanning is asynchronous to complete as fast as possible.
 
-When an error is detected, Selenium kicks in to take a screenshot of the website from the Chrome driver.
+### Selenium
+If enabled, when an error is detected, Selenium kicks in to take a screenshot of the website from the Chrome driver.
+
+### Time
+We are using ISO 8601 for time management

@@ -9,10 +9,7 @@ import asyncio
 import aiohttp
 import sys
 from multidict import CIMultiDictProxy
-
-from datetime import datetime
 from selenium import webdriver
-
 from datetime import datetime, timezone
 
 scriptdir = os.path.dirname(os.path.abspath(__file__))
@@ -126,7 +123,7 @@ def take_endpoint_screenshot(nonce=str, endpoint=str):
 
 async def do_endpoint_check(sites, site, endpoint):
     print(
-        "checking endpoint "
+        "- Checking endpoint "
         + str(endpoint)
         + " for a status code "
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
@@ -194,8 +191,10 @@ async def do_endpoint_check(sites, site, endpoint):
                     if html_path:
                         SCREENSHOTS.append((dom_nonce, html_path))
 
-                if not alert_raised:
-                    print(f"✅ Passed: {site}{endpoint}")
+                if alert_raised:
+                    print(f"❌ Alert raised for {site}{endpoint} - Exception: {ALERTS[-1]['alert']['exception']}")
+                else:
+                    print(f"   ✅ Passed: {endpoint}")
 
     except Exception as ex:
         message = str(ex) or "Unreachable, response code is 0"
@@ -227,8 +226,8 @@ def do_heartbeat_check(sites):
     for site in sites["sites"]:
         should_check = sites["sites"][site]["check"]
         if should_check:
-            print("----")
-            print("starting heartbeat check for " + site)
+            print("    ")
+            print("Starting checks for " + site)
             for endpoint in sites["sites"][site]["endpoints"]:
                 loop.run_until_complete(do_endpoint_check(sites, site, endpoint))
         else:
@@ -323,7 +322,6 @@ def get_email_markup():
         html_body += "<hr><br>"
 
     return html_body
-
 
 def send_urgent_email(
     html_body,
