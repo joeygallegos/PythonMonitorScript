@@ -13,6 +13,8 @@ from multidict import CIMultiDictProxy
 from datetime import datetime
 from selenium import webdriver
 
+from datetime import datetime, timezone
+
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
 
@@ -23,6 +25,79 @@ SCREENSHOTS = []
 SHOW_HEADERS = "--show-headers" in sys.argv
 TAKE_SCREENSHOT = "--take-screenshot" in sys.argv
 
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def load_tracking():
+    path = os.path.join(scriptdir, "tracking.json")
+    if not os.path.exists(path):
+        return {
+            "incident_active": False,
+            "incident_start": None,
+            "incident_last_seen": None,
+            "incident_duration": "0s",
+            "failures_total": 0,
+        }
+
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading tracking file: {e}")
+        return {}
+
+
+def save_tracking(data: dict):
+    path = os.path.join(scriptdir, "tracking.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error writing tracking file: {e}")
+
+
+def update_incident_tracking(alert_count: int):
+    """
+    Adjusts incident tracking info based on number of alerts this run.
+    Starts or ends an incident as needed.
+    """
+    tracking = load_tracking()
+    now = now_iso()
+
+    if alert_count > 0:
+        if not tracking.get("incident_active"):
+            print("⚠️ Incident STARTING")
+            tracking["incident_active"] = True
+            tracking["incident_start"] = now
+            tracking["failures_total"] = alert_count
+        else:
+            tracking["failures_total"] += alert_count
+
+        tracking["incident_last_seen"] = now
+
+        # Update duration
+        start_dt = datetime.fromisoformat(tracking["incident_start"]).replace(tzinfo=timezone.utc)
+        duration = datetime.now(timezone.utc) - start_dt
+        mins, secs = divmod(duration.total_seconds(), 60)
+        tracking["incident_duration"] = f"{int(mins)}m {int(secs)}s"
+
+        save_tracking(tracking)
+        return tracking
+
+    else:
+        if tracking.get("incident_active"):
+            print("✅ Incident CLEARED")
+
+        # Reset tracking
+        tracking = {
+            "incident_active": False,
+            "incident_start": None,
+            "incident_last_seen": None,
+            "incident_duration": "0s",
+            "failures_total": 0,
+        }
+        save_tracking(tracking)
+        return tracking
 
 def get_website_dictionary():
     sites_config_file = open(os.path.join(scriptdir, "sites.json"))
@@ -255,6 +330,7 @@ def send_urgent_email(
     failure_count=0,
     incident_start_timestamp_delta=str,
     incident_start_timestamp=str,
+    to_address=str
 ):
     print("send_urgent_email started")
     print("pulling email template")
@@ -293,16 +369,14 @@ def send_urgent_email(
         except Exception as e:
             print(f"Error reading {filename}: {e}")
 
-    print("posting request to mailgun..")
+    print(f"posting request to mailgun... to {to_address}")
     email_post = requests.post(
-        "https://api.mailgun.net/v3/"
-        + PARSER.get("DEFAULT", "MAILGUN_DOMAIN")
-        + "/messages",
+        f"https://api.mailgun.net/v3/{PARSER.get('DEFAULT', 'MAILGUN_DOMAIN')}/messages",
         auth=("api", PARSER.get("DEFAULT", "MAILGUN_PRIVATE_KEY")),
         files=files,
         data={
             "from": PARSER.get("DEFAULT", "MAILGUN_FROM"),
-            "to": [PARSER.get("DEFAULT", "ALERTS_EMAIL")],
+            "to": [to_address],
             "subject": "URGENT NOTIFICATION - PythonMonitorScript",
             "html": html_template,
         },
@@ -310,8 +384,6 @@ def send_urgent_email(
     print(str(email_post.status_code))
     print(str(email_post.text))
     print(str(email_post.headers))
-
-    # TODO: If error code is 401 then need to check IP whitelisting
     return email_post
 
 
@@ -426,89 +498,73 @@ if __name__ == "__main__":
     PARSER.read("config.ini")
     SCREENSHOTS_ENABLED = PARSER.getboolean("DEFAULT", "SCREENSHOTS_ENABLED")
 
-    # Set up options for browser headless mode
+    # Set up browser headless options
     options = webdriver.ChromeOptions()
-
-    is_debug = PARSER.getboolean("DEFAULT", "DEBUG")
-    if is_debug is False:
+    if not PARSER.getboolean("DEFAULT", "DEBUG"):
         options.add_argument("--headless")
-
     options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Initialize the WebDriver with the options
+    # Launch browser if screenshot capture is enabled
     if SCREENSHOTS_ENABLED:
         BROWSER = webdriver.Chrome(options=options)
 
-    # trigger checks for each site and associated endpoints
+    # Run endpoint checks
     do_heartbeat_check(get_website_dictionary())
 
-    # check if global alerts array list has values
+    # === POST-CHECK HANDLING ===
     if ALERTS:
-        current_fail_ticks = get_failed_ticks()
-        next_fail_ticks = int(current_fail_ticks) + 1
-        set_failed_ticks(next_fail_ticks)
-        
-        # if we detect our first fail, then set the incident start time
-        print("Checking if we need to set the incident start time")
-        if next_fail_ticks >= 1 and get_incident_start_timestamp() == "None":
-            print("Setting the incident start time since >= 1")
-            set_incident_start_timestamp(str(datetime.now()))
+        print(f"🔥 ALERTS detected: {len(ALERTS)} issue(s) found")
+        tracking_info = update_incident_tracking(len(ALERTS))
+        duration_str = tracking_info["incident_duration"]
+        duration_minutes = int(duration_str.split("m")[0])
+        to_email = PARSER.get("DEFAULT", "ALERTS_EMAIL")
 
-        if next_fail_ticks >= 5 and next_fail_ticks < 30:
-            print("Sending an alert to emails")
+        if duration_minutes >= 300:
+            print("🚨 Escalation threshold reached (5+ hours). Switching to escalation email.")
+            to_email = PARSER.get("DEFAULT", "ESCALATION_EMAIL")
+
+        # Email schedule rules
+        should_email = (
+            5 <= duration_minutes < 30
+            or (duration_minutes >= 30 and duration_minutes % 15 == 0)
+        )
+
+        if should_email:
+            print(f"📧 Sending alert email to {to_email}...")
             send_urgent_email(
                 get_email_markup(),
-                next_fail_ticks,
-                get_pretty_time(datetime.fromisoformat(get_incident_start_timestamp())),
-                get_incident_start_timestamp(),
-            )
-        elif next_fail_ticks >= 30 and next_fail_ticks % 15 == 0:
-            print("Sending an alert to emails")
-            send_urgent_email(
-                get_email_markup(),
-                next_fail_ticks,
-                get_pretty_time(datetime.fromisoformat(get_incident_start_timestamp())),
-                get_incident_start_timestamp(),
+                tracking_info["failures_total"],
+                duration_str,
+                tracking_info["incident_start"],
+                to_email,
             )
         else:
-            print(f"Skipped notification, greater than 30: next_fail_ticks={next_fail_ticks}")
+            print(f"⏳ Skipping email — incident active for {duration_str}")
 
     else:
-        count_fails = get_failed_ticks()
+        # No alerts → incident resolved
+        tracking_info = update_incident_tracking(0)
+        if tracking_info["incident_active"] is False:
+            print("✅ Incident has been resolved. Tracking reset.")
+        else:
+            print("⚠️ ALERTS cleared, but tracking still active. This shouldn't happen.")
 
-        # if the issue is resolved, but count is something very high
-        # then lets reset the tracking ticks to 5
-        # and for each time theres no alerts, lets subtract 1 until that number is 0
-        print("Failure counter is currently at " + str(count_fails))
-        if count_fails > 5:
-            set_failed_ticks(5)
-            print("Incident seems to be resolved...")
-            print(" - Resetting counter to 5")
-            print(" - Incrementally decreasing the failure count down to 0")
-
-        # if there are no alerts but count is still positive value, then decrease count by 1
-        elif count_fails > 0:
-            set_failed_ticks(int(count_fails) - 1)
-            print("decreasing failure count")
-
-        # if fail ticks resets to 0, then clear the incident start date
-        if count_fails == 0:
-            set_incident_start_timestamp(None)
-            print("All clear")
-
-    # Cleanup the running browser
+    # Cleanup browser session
     if SCREENSHOTS_ENABLED:
         BROWSER.quit()
 
-    # Cleanup delete the screenshot files
+    # Delete all temporary screenshot and HTML files
     if SCREENSHOTS_ENABLED and SCREENSHOTS:
-        for nonce, filename in SCREENSHOTS:
-            try:
-                os.remove(filename)
-                print(f"Deleted: {filename}")
-            except FileNotFoundError:
-                print(f"File not found: {filename}")
-            except Exception as e:
-                print(f"Error deleting {filename}: {e}")
+        deleted = set()
+        for _, filename in SCREENSHOTS:
+            if filename and filename not in deleted:
+                deleted.add(filename)
+                try:
+                    os.remove(filename)
+                    print(f"🧹 Deleted: {filename}")
+                except FileNotFoundError:
+                    print(f"⚠️ File not found (already deleted?): {filename}")
+                except Exception as e:
+                    print(f"❌ Error deleting {filename}: {e}")
