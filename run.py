@@ -56,114 +56,104 @@ async def do_endpoint_check(sites, site, endpoint):
         + " for a status code "
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
     )
-    # Setup the nonce for this test
-    nonce = str(uuid.uuid4().int)[:16]
+
+    # Set timeout and headers
+    timeout = aiohttp.ClientTimeout(total=5)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 PythonMonitorScript/1.0",
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+
     try:
-        # set timeout for whole request
-        timeout = aiohttp.ClientTimeout(total=5)
-
-        # specify the User-Agent header
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 PythonMonitorScript/1.0",
-            "Accept": "*/*",
-            "Connection": "close",
-        }
-
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://" + str(site) + str(endpoint), timeout=timeout, headers=headers
             ) as response:
-                # Extract the response body as a string
                 response_body = await response.text()
+                response_headers = response.headers
 
-                if response.status != int(
-                    sites["sites"][site]["endpoints"][endpoint]["status"]
-                ):
-                    print(
-                        "response code not "
-                        + str(sites["sites"][site]["endpoints"][endpoint]["status"])
-                        + ".. received "
-                        + str(response.status)
-                    )
+                # Flag for whether any alert was raised for this endpoint
+                alert_raised = False
+
+                # Status code mismatch
+                expected_status = int(sites["sites"][site]["endpoints"][endpoint]["status"])
+                if response.status != expected_status:
+                    status_nonce = str(uuid.uuid4().int)[:16]
                     ALERTS.append(
                         {
                             "alert": {
                                 "site": site,
                                 "endpoint": endpoint,
-                                "expected": int(
-                                    sites["sites"][site]["endpoints"][endpoint][
-                                        "status"
-                                    ]
-                                ),
+                                "expected": expected_status,
                                 "received": response.status,
                                 "exception": "Status code mismatch",
-                                "nonce": nonce,
+                                "nonce": status_nonce,
                                 "body": response_body,
-                                "headers": response.headers,
+                                "headers": response_headers,
                             }
                         }
                     )
+                    alert_raised = True
 
                     if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
                         take_endpoint_screenshot(
-                            nonce, "https://" + str(site) + str(endpoint)
+                            status_nonce, "https://" + str(site) + str(endpoint)
                         )
-                # if sites config has "dom_contains" string value, then check if that string is in the response text
-                search_key = sites["sites"][site]["endpoints"][endpoint]["dom_contains"]
 
-                # If search key is not empty, then search using it
-                if search_key:
-                    if str(response_body).find(str(search_key)) == -1:
-                        print(
-                            "response text does not contain "
-                            + str(
-                                sites["sites"][site]["endpoints"][endpoint][
-                                    "dom_contains"
-                                ]
-                            )
-                        )
-                        ALERTS.append(
-                            {
-                                "alert": {
-                                    "site": site,
-                                    "endpoint": endpoint,
-                                    "expected": 0,
-                                    "received": 0,
-                                    "exception": "DOM string mismatch",
-                                    "nonce": nonce,
-                                    "body": response_body,
-                                    "headers": response.headers,
-                                }
+                # DOM content check
+                search_key = sites["sites"][site]["endpoints"][endpoint]["dom_contains"]
+                if search_key and search_key not in response_body:
+                    dom_nonce = str(uuid.uuid4().int)[:16]
+                    ALERTS.append(
+                        {
+                            "alert": {
+                                "site": site,
+                                "endpoint": endpoint,
+                                "expected": 0,
+                                "received": 0,
+                                "exception": "DOM string mismatch",
+                                "nonce": dom_nonce,
+                                "body": response_body,
+                                "headers": response_headers,
                             }
+                        }
+                    )
+                    alert_raised = True
+
+                    if TAKE_SCREENSHOT:
+                        take_endpoint_screenshot(
+                            dom_nonce, "https://" + str(site) + str(endpoint)
                         )
-                        if TAKE_SCREENSHOT:
-                            take_endpoint_screenshot(
-                                nonce, "https://" + str(site) + str(endpoint)
-                            )
+
+                # Optional: If neither check failed, do nothing
+                if not alert_raised:
+                    print(f"✅ Passed: {site}{endpoint}")
+
     except Exception as ex:
-        message = str(ex)
-        if not message:
-            message = "Unreachable, response code is 0"
-            print("endpoint seems to be unreachable, response code is 0")
-            print("exception: " + str(message))
-            ALERTS.append(
-                {
-                    "alert": {
-                        "site": site,
-                        "endpoint": endpoint,
-                        "expected": int(
-                            sites["sites"][site]["endpoints"][endpoint]["status"]
-                        ),
-                        "received": 0,
-                        "exception": ex,
-                        "nonce": nonce,
-                        "body": None,
-                        "headers": None,
-                    }
+        message = str(ex) or "Unreachable, response code is 0"
+        print("endpoint seems to be unreachable, response code is 0")
+        print("exception: " + message)
+
+        fallback_nonce = str(uuid.uuid4().int)[:16]
+        ALERTS.append(
+            {
+                "alert": {
+                    "site": site,
+                    "endpoint": endpoint,
+                    "expected": int(sites["sites"][site]["endpoints"][endpoint]["status"]),
+                    "received": 0,
+                    "exception": message,
+                    "nonce": fallback_nonce,
+                    "body": None,
+                    "headers": None,
                 }
+            }
+        )
+        if TAKE_SCREENSHOT:
+            take_endpoint_screenshot(
+                fallback_nonce, "https://" + str(site) + str(endpoint)
             )
-            if TAKE_SCREENSHOT:
-                take_endpoint_screenshot(nonce, "https://" + str(site) + str(endpoint))
 
 
 def do_heartbeat_check(sites):
@@ -290,8 +280,8 @@ def send_urgent_email(
         except Exception as e:
             print(f"Error reading {filename}: {e}")
 
-    print("posting request to mailgun")
-    return requests.post(
+    print("posting request to mailgun..")
+    email_post = requests.post(
         "https://api.mailgun.net/v3/"
         + PARSER.get("DEFAULT", "MAILGUN_DOMAIN")
         + "/messages",
@@ -304,6 +294,12 @@ def send_urgent_email(
             "html": html_template,
         },
     )
+    print(str(email_post.status_code))
+    print(str(email_post.text))
+    print(str(email_post.headers))
+
+    # TODO: If error code is 401 then need to check IP whitelisting
+    return email_post
 
 
 # get json object from the file
