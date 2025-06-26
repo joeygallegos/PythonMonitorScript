@@ -57,7 +57,6 @@ async def do_endpoint_check(sites, site, endpoint):
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
     )
 
-    # Set timeout and headers
     timeout = aiohttp.ClientTimeout(total=5)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 PythonMonitorScript/1.0",
@@ -72,61 +71,54 @@ async def do_endpoint_check(sites, site, endpoint):
             ) as response:
                 response_body = await response.text()
                 response_headers = response.headers
-
-                # Flag for whether any alert was raised for this endpoint
+                expected_status = int(sites["sites"][site]["endpoints"][endpoint]["status"])
                 alert_raised = False
 
-                # Status code mismatch
-                expected_status = int(sites["sites"][site]["endpoints"][endpoint]["status"])
                 if response.status != expected_status:
                     status_nonce = str(uuid.uuid4().int)[:16]
-                    ALERTS.append(
-                        {
-                            "alert": {
-                                "site": site,
-                                "endpoint": endpoint,
-                                "expected": expected_status,
-                                "received": response.status,
-                                "exception": "Status code mismatch",
-                                "nonce": status_nonce,
-                                "body": response_body,
-                                "headers": response_headers,
-                            }
+                    ALERTS.append({
+                        "alert": {
+                            "site": site,
+                            "endpoint": endpoint,
+                            "expected": expected_status,
+                            "received": response.status,
+                            "exception": "Status code mismatch",
+                            "nonce": status_nonce,
+                            "body": response_body,
+                            "headers": response_headers,
                         }
-                    )
+                    })
                     alert_raised = True
 
                     if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
-                        take_endpoint_screenshot(
-                            status_nonce, "https://" + str(site) + str(endpoint)
-                        )
+                        take_endpoint_screenshot(status_nonce, f"https://{site}{endpoint}")
+                    html_path = save_html_to_file(status_nonce, response_body)
+                    if html_path:
+                        SCREENSHOTS.append((status_nonce, html_path))
 
-                # DOM content check
                 search_key = sites["sites"][site]["endpoints"][endpoint]["dom_contains"]
                 if search_key and search_key not in response_body:
                     dom_nonce = str(uuid.uuid4().int)[:16]
-                    ALERTS.append(
-                        {
-                            "alert": {
-                                "site": site,
-                                "endpoint": endpoint,
-                                "expected": 0,
-                                "received": 0,
-                                "exception": "DOM string mismatch",
-                                "nonce": dom_nonce,
-                                "body": response_body,
-                                "headers": response_headers,
-                            }
+                    ALERTS.append({
+                        "alert": {
+                            "site": site,
+                            "endpoint": endpoint,
+                            "expected": 0,
+                            "received": 0,
+                            "exception": "DOM string mismatch",
+                            "nonce": dom_nonce,
+                            "body": response_body,
+                            "headers": response_headers,
                         }
-                    )
+                    })
                     alert_raised = True
 
                     if TAKE_SCREENSHOT:
-                        take_endpoint_screenshot(
-                            dom_nonce, "https://" + str(site) + str(endpoint)
-                        )
+                        take_endpoint_screenshot(dom_nonce, f"https://{site}{endpoint}")
+                    html_path = save_html_to_file(dom_nonce, response_body)
+                    if html_path:
+                        SCREENSHOTS.append((dom_nonce, html_path))
 
-                # Optional: If neither check failed, do nothing
                 if not alert_raised:
                     print(f"✅ Passed: {site}{endpoint}")
 
@@ -136,24 +128,22 @@ async def do_endpoint_check(sites, site, endpoint):
         print("exception: " + message)
 
         fallback_nonce = str(uuid.uuid4().int)[:16]
-        ALERTS.append(
-            {
-                "alert": {
-                    "site": site,
-                    "endpoint": endpoint,
-                    "expected": int(sites["sites"][site]["endpoints"][endpoint]["status"]),
-                    "received": 0,
-                    "exception": message,
-                    "nonce": fallback_nonce,
-                    "body": None,
-                    "headers": None,
-                }
+        ALERTS.append({
+            "alert": {
+                "site": site,
+                "endpoint": endpoint,
+                "expected": int(sites["sites"][site]["endpoints"][endpoint]["status"]),
+                "received": 0,
+                "exception": message,
+                "nonce": fallback_nonce,
+                "body": None,
+                "headers": None,
             }
-        )
+        })
+
         if TAKE_SCREENSHOT:
-            take_endpoint_screenshot(
-                fallback_nonce, "https://" + str(site) + str(endpoint)
-            )
+            take_endpoint_screenshot(fallback_nonce, f"https://{site}{endpoint}")
+
 
 
 def do_heartbeat_check(sites):
@@ -183,6 +173,17 @@ def get_num_of_checks(site_name):
         # If site does not exist in config, return 0 or a message
         return 0  # Or return an error message if preferred
 
+def save_html_to_file(nonce: str, html: str) -> str:
+    path = PARSER.get("DEFAULT", "TMP_PATH_SCREENSHOTS")
+    filename = os.path.join(path, f"response_{nonce}.txt")
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+        return filename
+    except Exception as e:
+        print(f"Error saving HTML for nonce {nonce}: {e}")
+        return None
+
 
 def get_email_markup():
     print("get_email_markup started")
@@ -200,7 +201,8 @@ def get_email_markup():
     # Step 2: Iterate through the grouped alerts
     for site, alerts in grouped_alerts.items():
         # Count the number of failed checks
-        failed_checks = len(alerts)
+        unique_failures = {a["alert"]["endpoint"] for a in alerts}
+        failed_checks = len(unique_failures)
 
         # Get the total number of checks for the domain (from config)
         total_checks_for_domain = get_num_of_checks(site)
@@ -270,11 +272,22 @@ def send_urgent_email(
     )
 
     files = []
+    added_filenames = set()
+
     for nonce, filename in SCREENSHOTS:
+        if not filename or filename in added_filenames:
+            continue
+        added_filenames.add(filename)
+
         try:
-            with open(filename, "rb") as screenshot_file:
-                file_content = screenshot_file.read()
-                files.append(("inline", (f"{nonce}.png", file_content)))
+            with open(filename, "rb") as file_obj:
+                file_content = file_obj.read()
+                file_ext = os.path.splitext(filename)[1].lower()
+
+                if file_ext == ".png":
+                    files.append(("inline", (f"{nonce}.png", file_content)))
+                elif file_ext == ".txt":
+                    files.append(("attachment", (f"{nonce}.txt", file_content)))
         except FileNotFoundError:
             print(f"File not found: {filename}")
         except Exception as e:
