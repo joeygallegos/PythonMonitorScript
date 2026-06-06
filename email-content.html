@@ -1,3 +1,14 @@
-A heartbeat alert has been triggered. The failure count is currently {{failure_count}}.
-<br>Incident started {{incident_start_timestamp_delta}} ago at {{incident_start_timestamp_pretty}}.<br><br>
-<br>Please review the details:<br><br>{{replace_alerts}}
+<strong>PythonMonitorScript alert</strong>
+
+<br><br>
+<strong>Status</strong><br>
+Failures: {{failure_count}}<br>
+Incident start: {{incident_start_timestamp_pretty}}<br>
+Duration: {{incident_start_timestamp_delta}}<br>
+
+<br>
+<strong>Affected checks</strong><br>
+{{replace_alerts}}
+
+<strong>Action required</strong><br>
+Review the failed endpoint or certificate warning and confirm service health.
