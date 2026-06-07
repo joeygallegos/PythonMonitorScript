@@ -14,6 +14,10 @@ import sys
 from math import ceil
 from datetime import datetime, timezone
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     import requests
 except ImportError:
@@ -127,8 +131,9 @@ def get_manual_text():
     return """PythonMonitorScript manual
 
 Purpose
-  Monitor configured HTTPS endpoints and send Mailgun alerts when checks fail.
-  Also checks enabled domains' HTTPS certificate expiry once per UTC day.
+  Monitor configured HTTP or HTTPS endpoints and send Mailgun alerts when
+  checks fail. Also checks enabled HTTPS domains' certificate expiry once per
+  UTC day.
 
 Normal usage
   python run.py
@@ -175,7 +180,8 @@ Config files
       Optional keys: ESCALATION_AFTER_MINUTES defaults to 300.
 
   sites.json
-      Domains, endpoint paths, expected status codes, and optional DOM strings.
+      Domains, optional scheme ("https" by default, or "http"), endpoint paths,
+      expected status codes, and optional DOM strings.
 
   tracking.json
       Persistent incident state and daily certificate scheduling state.
@@ -187,8 +193,8 @@ Email behavior
   incident reaches ESCALATION_AFTER_MINUTES, then ESCALATION_EMAIL is used.
 
 Certificate behavior
-  Certificates alert when expiry is 10 days away or less, or when the
-  certificate cannot be fetched or parsed.
+  HTTPS certificates alert when expiry is 10 days away or less, or when the
+  certificate cannot be fetched or parsed. HTTP sites skip certificate checks.
 """
 
 
@@ -367,6 +373,23 @@ def get_website_dictionary():
     return sites_to_monitor
 
 
+def get_site_scheme(site_config):
+    # Existing site entries predate this option, so HTTPS remains the default.
+    scheme = str(site_config.get("scheme", "https")).lower().strip()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported site scheme: {scheme}")
+    return scheme
+
+
+def build_endpoint_url(sites, site, endpoint):
+    scheme = get_site_scheme(sites["sites"][site])
+    return f"{scheme}://{site}{endpoint}"
+
+
+def uses_https(site_config):
+    return get_site_scheme(site_config) == "https"
+
+
 def take_endpoint_screenshot(nonce=str, endpoint=str):
     # Screenshots are optional and only useful when Selenium is enabled. The
     # nonce ties the screenshot attachment back to a specific alert in email.
@@ -393,11 +416,14 @@ def take_endpoint_screenshot(nonce=str, endpoint=str):
 
 
 async def do_endpoint_check(sites, site, endpoint):
-    # Checks one configured HTTPS endpoint for both response status and an
+    # Checks one configured endpoint for both response status and an
     # optional expected substring in the response body.
+    endpoint_url = build_endpoint_url(sites, site, endpoint)
     print(
         "- Checking endpoint "
         + str(endpoint)
+        + " at "
+        + endpoint_url
         + " for a status code "
         + str(sites["sites"][site]["endpoints"][endpoint]["status"])
     )
@@ -414,7 +440,7 @@ async def do_endpoint_check(sites, site, endpoint):
         # less efficient than sharing one session across all endpoint checks.
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://" + str(site) + str(endpoint), timeout=timeout, headers=headers
+                endpoint_url, timeout=timeout, headers=headers
             ) as response:
                 response_body = await response.text()
                 response_headers = response.headers
@@ -445,9 +471,7 @@ async def do_endpoint_check(sites, site, endpoint):
                     alert_raised = True
 
                     if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
-                        take_endpoint_screenshot(
-                            status_nonce, f"https://{site}{endpoint}"
-                        )
+                        take_endpoint_screenshot(status_nonce, endpoint_url)
                     html_path = save_html_to_file(status_nonce, response_body)
                     if html_path:
                         SCREENSHOTS.append((status_nonce, html_path))
@@ -474,7 +498,7 @@ async def do_endpoint_check(sites, site, endpoint):
                     alert_raised = True
 
                     if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
-                        take_endpoint_screenshot(dom_nonce, f"https://{site}{endpoint}")
+                        take_endpoint_screenshot(dom_nonce, endpoint_url)
                     html_path = save_html_to_file(dom_nonce, response_body)
                     if html_path:
                         SCREENSHOTS.append((dom_nonce, html_path))
@@ -512,7 +536,7 @@ async def do_endpoint_check(sites, site, endpoint):
         )
 
         if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
-            take_endpoint_screenshot(fallback_nonce, f"https://{site}{endpoint}")
+            take_endpoint_screenshot(fallback_nonce, endpoint_url)
 
 
 def do_heartbeat_check(sites):
@@ -524,7 +548,7 @@ def do_heartbeat_check(sites):
         should_check = sites["sites"][site]["check"]
         if should_check:
             print("    ")
-            print("Starting checks for " + site)
+            print("Starting checks for " + get_site_scheme(sites["sites"][site]) + "://" + site)
             for endpoint in sites["sites"][site]["endpoints"]:
                 loop.run_until_complete(do_endpoint_check(sites, site, endpoint))
         else:
@@ -614,8 +638,8 @@ def certificate_needs_alert(expires_at, now=None):
 
 
 def do_certificate_checks(sites):
-    # Check each enabled domain's HTTPS certificate. Certificate monitoring is
-    # domain-level, not endpoint-level.
+    # Check each enabled HTTPS domain's certificate. Certificate monitoring is
+    # domain-level, not endpoint-level, and HTTP-only sites do not have certs.
     print("do_certificate_checks started")
     certificate_alerts = []
 
@@ -624,6 +648,10 @@ def do_certificate_checks(sites):
             # Reuse the same site-level enable/disable switch as heartbeat
             # monitoring to avoid adding config complexity.
             print("certificate check skipped because check variable is false for " + site)
+            continue
+
+        if not uses_https(site_config):
+            print("certificate check skipped because scheme is not https for " + site)
             continue
 
         print(f"- Checking certificate for {site}")

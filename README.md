@@ -34,11 +34,33 @@ Heartbeat alert emails go to `ALERTS_EMAIL` first. If the same incident remains 
 Manual test sends with `--force-email` always go to `ALERTS_EMAIL` so escalation recipients are not notified during testing.
 
 ### Certificate monitoring
-The script also checks HTTPS certificate expiration for every domain in `sites.json` where `check` is set to `true`.
+The script also checks HTTPS certificate expiration for every domain in `sites.json` where `check` is set to `true` and `scheme` is `https`.
 
 Because the cronjob runs every minute, certificate checks are gated by `tracking.json` and only run once per UTC day. If a certificate expires in 10 days or less, or if the certificate cannot be fetched or parsed, the script sends a Mailgun alert email using the same email template flow as heartbeat alerts.
 
 Certificate state is tracked with `certificate_last_checked_date` and `certificate_last_alerted_date` in `tracking.json`.
+
+### HTTP endpoints
+Sites default to HTTPS. To monitor a local HTTP-only server, set `scheme` to `http` on that site in `sites.json`:
+
+```json
+{
+  "sites": {
+    "localhost:8000": {
+      "check": true,
+      "scheme": "http",
+      "endpoints": {
+        "/": {
+          "status": 200,
+          "dom_contains": ""
+        }
+      }
+    }
+  }
+}
+```
+
+HTTP sites are skipped by certificate monitoring.
 
 ### Selenium
 If enabled, when an error is detected, Selenium kicks in to take a screenshot of the website from the Chrome driver.

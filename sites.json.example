@@ -2,6 +2,7 @@
     "sites": {
         "google.com": {
             "check": true,
+            "scheme": "https",
             "endpoints": {
                 "/": {
                     "status": 200,
@@ -10,6 +11,16 @@
                 "/.well-known/security.txt": {
                     "status": 200,
                     "dom_contains": "security@google.com"
+                }
+            }
+        },
+        "localhost:8000": {
+            "check": true,
+            "scheme": "http",
+            "endpoints": {
+                "/": {
+                    "status": 200,
+                    "dom_contains": ""
                 }
             }
         }

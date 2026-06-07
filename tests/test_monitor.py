@@ -96,6 +96,62 @@ class CertificateMonitoringTests(unittest.TestCase):
         run.save_tracking = lambda data: saved_state.update(copy.deepcopy(data))
 
 
+class SiteSchemeTests(unittest.TestCase):
+    def setUp(self):
+        self.original_print = run.print if hasattr(run, "print") else print
+        run.print = lambda *args, **kwargs: None
+        self.addCleanup(setattr, run, "print", self.original_print)
+
+    def test_site_scheme_defaults_to_https(self):
+        sites = {
+            "sites": {
+                "example.com": {
+                    "check": True,
+                    "endpoints": {"/": {"status": 200, "dom_contains": ""}},
+                }
+            }
+        }
+
+        self.assertEqual("https", run.get_site_scheme(sites["sites"]["example.com"]))
+        self.assertEqual("https://example.com/", run.build_endpoint_url(sites, "example.com", "/"))
+
+    def test_site_scheme_supports_http(self):
+        sites = {
+            "sites": {
+                "localhost:8000": {
+                    "check": True,
+                    "scheme": "http",
+                    "endpoints": {"/": {"status": 200, "dom_contains": ""}},
+                }
+            }
+        }
+
+        self.assertEqual("http", run.get_site_scheme(sites["sites"]["localhost:8000"]))
+        self.assertEqual("http://localhost:8000/", run.build_endpoint_url(sites, "localhost:8000", "/"))
+
+    def test_site_scheme_rejects_unknown_values(self):
+        with self.assertRaises(ValueError):
+            run.get_site_scheme({"scheme": "ftp"})
+
+    def test_certificate_checks_skip_http_sites(self):
+        sites = {
+            "sites": {
+                "localhost:8000": {
+                    "check": True,
+                    "scheme": "http",
+                    "endpoints": {"/": {"status": 200, "dom_contains": ""}},
+                }
+            }
+        }
+        original_get_certificate_expiry = run.get_certificate_expiry
+        run.get_certificate_expiry = lambda *_args, **_kwargs: self.fail(
+            "HTTP sites should not fetch HTTPS certificates"
+        )
+        self.addCleanup(setattr, run, "get_certificate_expiry", original_get_certificate_expiry)
+
+        self.assertEqual([], run.do_certificate_checks(sites))
+
+
 class IncidentTrackingTests(unittest.TestCase):
     def setUp(self):
         self.original_print = run.print if hasattr(run, "print") else print
