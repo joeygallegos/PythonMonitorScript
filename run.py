@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import html
-import requests
+import logging
 import configparser
 import os
 import socket
@@ -9,12 +10,29 @@ import ssl
 import time
 import uuid
 import asyncio
-import aiohttp
 import sys
 from math import ceil
-from multidict import CIMultiDictProxy
-from selenium import webdriver
 from datetime import datetime, timezone
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
+    from multidict import CIMultiDictProxy
+except ImportError:
+    CIMultiDictProxy = ()
+
+try:
+    from selenium import webdriver
+except ImportError:
+    webdriver = None
 
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
@@ -29,6 +47,199 @@ SCREENSHOTS = []
 SHOW_HEADERS = "--show-headers" in sys.argv
 TAKE_SCREENSHOT = "--take-screenshot" in sys.argv
 CERTIFICATE_EXPIRY_WARNING_DAYS = 10
+# Heartbeat escalation is intentionally much slower than normal alerting.
+# ALERTS_EMAIL gets the early/noisy notifications first, then an unresolved
+# incident moves to ESCALATION_EMAIL after this many minutes unless config.ini
+# overrides the value.
+DEFAULT_ESCALATION_AFTER_MINUTES = 300
+DRY_RUN = False
+FORCE_EMAIL = False
+FORCE_CERTIFICATE_CHECK = False
+LOGGER = logging.getLogger("PythonMonitorScript")
+
+
+def parse_args(argv=None):
+    # Keep command-line options centralized so cron/manual execution behavior is
+    # explicit and tests can parse options without running the monitor.
+    parser = argparse.ArgumentParser(
+        description="Monitor website health checks and HTTPS certificate renewals.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python run.py
+      Run normal heartbeat checks, update tracking.json, and send emails by cadence.
+
+  python run.py --dry-run --force-email
+      Exercise check and email rendering paths without writing state or posting to Mailgun.
+
+  python run.py --force-certificate-check
+      Run the daily certificate pass even if it already ran today.
+
+Required config.ini keys:
+  MAILGUN_PRIVATE_KEY, MAILGUN_DOMAIN, MAILGUN_FROM, ALERTS_EMAIL,
+  ESCALATION_EMAIL, SCREENSHOTS_ENABLED, TMP_PATH_SCREENSHOTS, DEBUG
+
+Optional config.ini keys:
+  ESCALATION_AFTER_MINUTES defaults to 300 if omitted.
+
+Sites are configured in sites.json. Domains with "check": true are checked.
+""",
+    )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Print the full built-in manual and exit.",
+    )
+    parser.add_argument(
+        "--show-headers",
+        action="store_true",
+        help="Include response headers and body content in alert emails.",
+    )
+    parser.add_argument(
+        "--take-screenshot",
+        action="store_true",
+        help="Capture Selenium screenshots for failed checks when enabled in config.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run checks without writing tracking.json, deleting artifacts, or sending email.",
+    )
+    parser.add_argument(
+        "--force-email",
+        action="store_true",
+        help="Send alert email whenever current failures exist, ignoring normal cadence.",
+    )
+    parser.add_argument(
+        "--force-certificate-check",
+        action="store_true",
+        help="Run certificate checks even if they already ran today.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Console log verbosity.",
+    )
+    return parser.parse_args(argv)
+
+
+def get_manual_text():
+    return """PythonMonitorScript manual
+
+Purpose
+  Monitor configured HTTPS endpoints and send Mailgun alerts when checks fail.
+  Also checks enabled domains' HTTPS certificate expiry once per UTC day.
+
+Normal usage
+  python run.py
+
+  Intended cron usage is once per minute. Heartbeat checks run every execution.
+  Certificate checks are gated by tracking.json and run once per UTC day.
+
+Testing usage
+  python run.py --dry-run
+      Run checks without writing tracking.json, creating response artifacts, or
+      sending Mailgun email.
+
+  python run.py --dry-run --force-email
+      Force the email-rendering path for current heartbeat failures without
+      posting to Mailgun. Forced heartbeat emails use ALERTS_EMAIL so testing
+      does not notify the escalation recipient.
+
+  python run.py --force-email
+      Send heartbeat alert email whenever failures exist, ignoring the normal
+      5-minute delay and 15-minute reminder cadence. The forced email is sent
+      to ALERTS_EMAIL even when the stored incident is already past the
+      escalation threshold.
+
+  python run.py --force-certificate-check
+      Run certificate checks even when certificate_last_checked_date is today.
+
+Debug options
+  --show-headers
+      Include response headers and body content in heartbeat alert emails.
+
+  --take-screenshot
+      Capture Selenium screenshots for failed checks when SCREENSHOTS_ENABLED
+      is true in config.ini.
+
+  --log-level DEBUG|INFO|WARNING|ERROR
+      Control console log verbosity.
+
+Config files
+  config.ini
+      Mailgun credentials, recipient emails, screenshot behavior, and debug mode.
+      Required keys: MAILGUN_PRIVATE_KEY, MAILGUN_DOMAIN, MAILGUN_FROM,
+      ALERTS_EMAIL, ESCALATION_EMAIL, SCREENSHOTS_ENABLED,
+      TMP_PATH_SCREENSHOTS, DEBUG.
+      Optional keys: ESCALATION_AFTER_MINUTES defaults to 300.
+
+  sites.json
+      Domains, endpoint paths, expected status codes, and optional DOM strings.
+
+  tracking.json
+      Persistent incident state and daily certificate scheduling state.
+
+Email behavior
+  Heartbeat emails are suppressed for the first 5 minutes of an incident.
+  From 5 through 29 minutes, emails send every run. From 30 minutes onward,
+  reminders send every 15 minutes. Alerts go to ALERTS_EMAIL until the
+  incident reaches ESCALATION_AFTER_MINUTES, then ESCALATION_EMAIL is used.
+
+Certificate behavior
+  Certificates alert when expiry is 10 days away or less, or when the
+  certificate cannot be fetched or parsed.
+"""
+
+
+def setup_logging(level="INFO"):
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def get_missing_dependencies(screenshots_enabled=False):
+    # Keep --manual usable even before dependencies are installed, but fail
+    # clearly before running monitor work that needs those packages.
+    missing = []
+    if requests is None:
+        missing.append("requests")
+    if aiohttp is None:
+        missing.append("aiohttp")
+    if CIMultiDictProxy == ():
+        missing.append("multidict")
+    if screenshots_enabled and webdriver is None:
+        missing.append("selenium")
+    return missing
+
+
+def get_escalation_after_minutes(parser):
+    # Keep the historical five-hour escalation default, but allow config.ini to
+    # make the high threshold explicit for different deployments. A missing or
+    # malformed value falls back to the default instead of crashing the monitor,
+    # because alert delivery should keep working even after a config typo.
+    try:
+        return parser.getint("DEFAULT", "ESCALATION_AFTER_MINUTES")
+    except (configparser.Error, ValueError):
+        return DEFAULT_ESCALATION_AFTER_MINUTES
+
+
+def get_alert_recipient(parser, duration_minutes, force_email=False):
+    # Initial and ongoing non-escalated alerts always go to ALERTS_EMAIL. Only
+    # incidents that remain unresolved past the high threshold move to
+    # ESCALATION_EMAIL. --force-email is mainly a manual testing path, so keep
+    # it pointed at ALERTS_EMAIL instead of unexpectedly paging escalation.
+    escalation_after_minutes = get_escalation_after_minutes(parser)
+    if force_email:
+        # A forced email can be run against old tracking.json state. Without
+        # this branch, testing a long-running incident would send to
+        # ESCALATION_EMAIL, which is surprising when the operator only wants to
+        # validate Mailgun/template behavior.
+        return parser.get("DEFAULT", "ALERTS_EMAIL"), escalation_after_minutes
+    if duration_minutes >= escalation_after_minutes:
+        return parser.get("DEFAULT", "ESCALATION_EMAIL"), escalation_after_minutes
+    return parser.get("DEFAULT", "ALERTS_EMAIL"), escalation_after_minutes
 
 
 def now_iso():
@@ -79,12 +290,17 @@ def load_tracking():
 
 def save_tracking(data: dict):
     # All persistent monitor state writes flow through this helper.
+    if DRY_RUN:
+        LOGGER.info("DRY RUN: skipping tracking.json write")
+        LOGGER.debug("DRY RUN tracking payload: %s", json.dumps(data, indent=2))
+        return
+
     path = os.path.join(scriptdir, "tracking.json")
     try:
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"Error writing tracking file: {e}")
+        LOGGER.error("Error writing tracking file: %s", e)
 
 
 def update_incident_tracking(alert_count: int):
@@ -154,6 +370,10 @@ def get_website_dictionary():
 def take_endpoint_screenshot(nonce=str, endpoint=str):
     # Screenshots are optional and only useful when Selenium is enabled. The
     # nonce ties the screenshot attachment back to a specific alert in email.
+    if DRY_RUN:
+        LOGGER.info("DRY RUN: skipping screenshot for %s", endpoint)
+        return
+
     path = PARSER.get("DEFAULT", "TMP_PATH_SCREENSHOTS")
 
     # Filename based on path and nonce
@@ -166,10 +386,10 @@ def take_endpoint_screenshot(nonce=str, endpoint=str):
         BROWSER.save_screenshot(filename)
         SCREENSHOTS.append((nonce, filename))
     except Exception as e:
-        print(f"Error accessing {endpoint}: {e}")
-        BROWSER.save_screenshot(filename)
-        SCREENSHOTS.append((nonce, filename))
-        # TODO: Handle the error as needed, e.g., log it or take alternative action
+        LOGGER.error("Error accessing %s for screenshot: %s", endpoint, e)
+        if BROWSER is not None:
+            BROWSER.save_screenshot(filename)
+            SCREENSHOTS.append((nonce, filename))
 
 
 async def do_endpoint_check(sites, site, endpoint):
@@ -253,7 +473,7 @@ async def do_endpoint_check(sites, site, endpoint):
                     )
                     alert_raised = True
 
-                    if TAKE_SCREENSHOT:
+                    if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
                         take_endpoint_screenshot(dom_nonce, f"https://{site}{endpoint}")
                     html_path = save_html_to_file(dom_nonce, response_body)
                     if html_path:
@@ -291,7 +511,7 @@ async def do_endpoint_check(sites, site, endpoint):
             }
         )
 
-        if TAKE_SCREENSHOT:
+        if TAKE_SCREENSHOT and SCREENSHOTS_ENABLED:
             take_endpoint_screenshot(fallback_nonce, f"https://{site}{endpoint}")
 
 
@@ -344,6 +564,14 @@ def update_certificate_tracking(checked_date, alerted=False):
         tracking["certificate_last_alerted_date"] = checked_date
     save_tracking(tracking)
     return tracking
+
+
+def should_send_alert_email(duration_minutes, force_email=False):
+    # Normal cadence suppresses very short incidents and reduces reminder noise.
+    # The force flag is for deliberate manual testing.
+    return force_email or 5 <= duration_minutes < 30 or (
+        duration_minutes >= 30 and duration_minutes % 15 == 0
+    )
 
 
 def get_certificate_expiry(domain, port=443, timeout=5):
@@ -477,6 +705,10 @@ def get_certificate_email_markup(certificate_alerts):
 def save_html_to_file(nonce: str, html: str) -> str:
     # Save the raw response body for failed checks. These files can be attached
     # to emails when screenshots/debug attachments are enabled.
+    if DRY_RUN:
+        LOGGER.info("DRY RUN: skipping response body artifact for nonce %s", nonce)
+        return None
+
     path = PARSER.get("DEFAULT", "TMP_PATH_SCREENSHOTS")
     filename = os.path.join(path, f"response_{nonce}.txt")
     try:
@@ -557,29 +789,60 @@ def get_email_markup():
     return html_body
 
 
-def send_urgent_email(
+def render_email_template(
     html_body,
-    failure_count=0,
+    current_failure_count=0,
+    incident_observations=0,
     incident_start_timestamp_delta=str,
     incident_start_timestamp=str,
-    to_address=str,
-    subject="URGENT NOTIFICATION - PythonMonitorScript",
 ):
-    # Render the shared HTML template and post it to Mailgun. This function is
-    # used for both heartbeat alerts and certificate alerts.
-    print("send_urgent_email started")
-    print("pulling email template")
-    html_template = open(os.path.join(scriptdir, "email-content.html"))
-    html_template = html_template.read()
-    print("replacing variables in the template")
+    # The shared template uses both current failures and cumulative incident
+    # observations so alert emails do not imply every observed failure is still
+    # active right now.
+    with open(os.path.join(scriptdir, "email-content.html")) as template_file:
+        html_template = template_file.read()
     html_template = str(html_template).replace("{{replace_alerts}}", html_body)
-    html_template = str(html_template).replace("{{failure_count}}", str(failure_count))
+    html_template = str(html_template).replace(
+        "{{current_failure_count}}", str(current_failure_count)
+    )
+    html_template = str(html_template).replace(
+        "{{incident_observations}}", str(incident_observations)
+    )
+    html_template = str(html_template).replace(
+        "{{failure_count}}", str(incident_observations)
+    )
     html_template = str(html_template).replace(
         "{{incident_start_timestamp_delta}}", str(incident_start_timestamp_delta)
     )
     html_template = str(html_template).replace(
         "{{incident_start_timestamp_pretty}}",
         format_incident_start_pretty(str(incident_start_timestamp)),
+    )
+    return html_template
+
+
+def send_urgent_email(
+    html_body,
+    current_failure_count=0,
+    incident_start_timestamp_delta=str,
+    incident_start_timestamp=str,
+    to_address=str,
+    subject="URGENT NOTIFICATION - PythonMonitorScript",
+    incident_observations=None,
+):
+    # Render the shared HTML template and post it to Mailgun. This function is
+    # used for both heartbeat alerts and certificate alerts.
+    LOGGER.info("Preparing email to %s", to_address)
+    if incident_observations is None:
+        incident_observations = current_failure_count
+
+    LOGGER.debug("Rendering email template")
+    html_template = render_email_template(
+        html_body,
+        current_failure_count,
+        incident_observations,
+        incident_start_timestamp_delta,
+        incident_start_timestamp,
     )
 
     files = []
@@ -602,11 +865,17 @@ def send_urgent_email(
                 elif file_ext == ".txt":
                     files.append(("attachment", (f"{nonce}.txt", file_content)))
         except FileNotFoundError:
-            print(f"File not found: {filename}")
+            LOGGER.warning("Email attachment file not found: %s", filename)
         except Exception as e:
-            print(f"Error reading {filename}: {e}")
+            LOGGER.error("Error reading email attachment %s: %s", filename, e)
 
-    print(f"posting request to mailgun... to {to_address}")
+    if DRY_RUN:
+        LOGGER.info("DRY RUN: skipping Mailgun post to %s", to_address)
+        LOGGER.info("DRY RUN email subject: %s", subject)
+        LOGGER.debug("DRY RUN email html: %s", html_template)
+        return None
+
+    LOGGER.info("Posting request to Mailgun for %s", to_address)
     email_post = requests.post(
         f"https://api.mailgun.net/v3/{PARSER.get('DEFAULT', 'MAILGUN_DOMAIN')}/messages",
         auth=("api", PARSER.get("DEFAULT", "MAILGUN_PRIVATE_KEY")),
@@ -618,9 +887,11 @@ def send_urgent_email(
             "html": html_template,
         },
     )
-    print(str(email_post.status_code))
-    print(str(email_post.text))
-    print(str(email_post.headers))
+    if email_post.status_code >= 400:
+        LOGGER.error("Mailgun returned %s: %s", email_post.status_code, email_post.text)
+    else:
+        LOGGER.info("Mailgun returned %s: %s", email_post.status_code, email_post.text)
+    LOGGER.debug("Mailgun response headers: %s", email_post.headers)
     return email_post
 
 
@@ -733,23 +1004,42 @@ def get_pretty_time(then, now=datetime.now(), interval="default"):
 if __name__ == "__main__":
     # Runtime entrypoint for cron/manual execution. Importing run.py for tests
     # should not execute this block.
-    print("Reading data from config.ini")
+    args = parse_args()
+    if args.manual:
+        print(get_manual_text())
+        sys.exit(0)
+
+    setup_logging(args.log_level)
+    SHOW_HEADERS = args.show_headers
+    TAKE_SCREENSHOT = args.take_screenshot
+    DRY_RUN = args.dry_run
+    FORCE_EMAIL = args.force_email
+    FORCE_CERTIFICATE_CHECK = args.force_certificate_check
+
+    LOGGER.info("Reading data from config.ini")
     PARSER.read("config.ini")
     SCREENSHOTS_ENABLED = PARSER.getboolean("DEFAULT", "SCREENSHOTS_ENABLED")
+    missing_dependencies = get_missing_dependencies(SCREENSHOTS_ENABLED)
+    if missing_dependencies:
+        LOGGER.error(
+            "Missing required Python packages: %s. Install with: pip install -r requirements.txt",
+            ", ".join(missing_dependencies),
+        )
+        sys.exit(1)
+
     websites = get_website_dictionary()
 
-    # Set up browser headless options
-    # Selenium is initialized only when screenshot capture is enabled, because
-    # launching Chrome is relatively expensive and unnecessary for normal checks.
-    options = webdriver.ChromeOptions()
-    if not PARSER.getboolean("DEFAULT", "DEBUG"):
-        options.add_argument("--headless")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-
     # Launch browser if screenshot capture is enabled
-    if SCREENSHOTS_ENABLED:
+    if SCREENSHOTS_ENABLED and not DRY_RUN:
+        # Selenium is initialized only when screenshot capture is enabled,
+        # because launching Chrome is relatively expensive and unnecessary for
+        # normal checks.
+        options = webdriver.ChromeOptions()
+        if not PARSER.getboolean("DEFAULT", "DEBUG"):
+            options.add_argument("--headless")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         BROWSER = webdriver.Chrome(options=options)
 
     # Run endpoint checks
@@ -764,31 +1054,44 @@ if __name__ == "__main__":
         tracking_info = update_incident_tracking(len(ALERTS))
         duration_str = tracking_info["incident_duration"]
         duration_minutes = int(duration_str.split("m")[0])
-        to_email = PARSER.get("DEFAULT", "ALERTS_EMAIL")
-
-        if duration_minutes >= 300:
-            # After five hours, route ongoing outage alerts to the escalation
-            # address from config.ini.
-            print(
-                "🚨 Escalation threshold reached (5+ hours). Switching to escalation email."
-            )
-            to_email = PARSER.get("DEFAULT", "ESCALATION_EMAIL")
-
-        # Email schedule rules
-        # Suppress emails for the first few minutes to avoid noisy one-off
-        # failures. After 30 minutes, send reminders every 15 minutes.
-        should_email = 5 <= duration_minutes < 30 or (
-            duration_minutes >= 30 and duration_minutes % 15 == 0
+        # Recipient selection is separate from email cadence. The cadence
+        # decides whether this run should send anything; recipient selection
+        # decides whether that send is still a normal alert or has become an
+        # escalation. FORCE_EMAIL keeps recipient selection on ALERTS_EMAIL so
+        # manual test sends do not notify the escalation contact.
+        to_email, escalation_after_minutes = get_alert_recipient(
+            PARSER, duration_minutes, force_email=FORCE_EMAIL
         )
+
+        if duration_minutes >= escalation_after_minutes and not FORCE_EMAIL:
+            # For normal cron runs, a long-running incident has exceeded the
+            # configured unresolved threshold, so future reminder emails route
+            # to ESCALATION_EMAIL until the incident clears.
+            print(
+                f"🚨 Escalation threshold reached ({escalation_after_minutes}+ minutes). Switching to escalation email."
+            )
+        elif duration_minutes >= escalation_after_minutes and FORCE_EMAIL:
+            # The incident may already be old in tracking.json, but this run is
+            # explicitly a manual force-send. Keep it on ALERTS_EMAIL and make
+            # that visible in console output.
+            print(
+                "📧 Force email enabled. Sending test alert to ALERTS_EMAIL instead of escalation recipient."
+            )
+
+        # Email schedule rules: suppress emails for the first few minutes to
+        # avoid noisy one-off failures. After 30 minutes, send reminders every
+        # 15 minutes. --force-email intentionally bypasses this for testing.
+        should_email = should_send_alert_email(duration_minutes, FORCE_EMAIL)
 
         if should_email:
             print(f"📧 Sending alert email to {to_email}...")
             send_urgent_email(
                 get_email_markup(),
-                tracking_info["failures_total"],
+                len(ALERTS),
                 duration_str,
                 tracking_info["incident_start"],
                 to_email,
+                incident_observations=tracking_info["failures_total"],
             )
         else:
             print(f"⏳ Skipping email — incident active for {duration_str}")
@@ -805,7 +1108,9 @@ if __name__ == "__main__":
 
     tracking_info = load_tracking()
     today = utc_today_str()
-    if should_run_certificate_check(tracking_info, today):
+    if FORCE_CERTIFICATE_CHECK or should_run_certificate_check(tracking_info, today):
+        if FORCE_CERTIFICATE_CHECK:
+            LOGGER.info("Forcing certificate checks despite daily gate")
         # Certificate checks are lower frequency than heartbeat checks. The
         # tracking file prevents running them more than once per UTC day.
         certificate_alerts = do_certificate_checks(websites)
@@ -828,12 +1133,12 @@ if __name__ == "__main__":
 
     # Cleanup browser session
     # Always close Chrome if it was opened for screenshots.
-    if SCREENSHOTS_ENABLED:
+    if SCREENSHOTS_ENABLED and BROWSER is not None:
         BROWSER.quit()
 
     # Delete all temporary screenshot and HTML files
     # These files are per-run diagnostic artifacts and should not accumulate.
-    if SCREENSHOTS_ENABLED and SCREENSHOTS:
+    if SCREENSHOTS_ENABLED and not DRY_RUN and SCREENSHOTS:
         deleted = set()
         for _, filename in SCREENSHOTS:
             if filename and filename not in deleted:

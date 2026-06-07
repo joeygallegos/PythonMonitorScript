@@ -1,4 +1,5 @@
 import copy
+import configparser
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -173,6 +174,122 @@ class IncidentTrackingTests(unittest.TestCase):
         run.save_tracking = lambda data: saved_state.update(copy.deepcopy(data))
 
 
+class AlertCadenceTests(unittest.TestCase):
+    def test_alert_email_cadence_suppresses_short_incidents(self):
+        self.assertFalse(run.should_send_alert_email(0))
+        self.assertFalse(run.should_send_alert_email(4))
+
+    def test_alert_email_cadence_sends_between_five_and_twenty_nine_minutes(self):
+        self.assertTrue(run.should_send_alert_email(5))
+        self.assertTrue(run.should_send_alert_email(29))
+
+    def test_alert_email_cadence_sends_every_fifteen_minutes_after_thirty(self):
+        self.assertTrue(run.should_send_alert_email(30))
+        self.assertFalse(run.should_send_alert_email(31))
+        self.assertTrue(run.should_send_alert_email(45))
+
+    def test_force_email_overrides_cadence(self):
+        self.assertTrue(run.should_send_alert_email(0, force_email=True))
+
+
+class EscalationRoutingTests(unittest.TestCase):
+    def make_parser(self, escalation_after_minutes=None):
+        parser = configparser.ConfigParser()
+        parser["DEFAULT"] = {
+            "ALERTS_EMAIL": "alerts@example.com",
+            "ESCALATION_EMAIL": "escalation@example.com",
+        }
+        if escalation_after_minutes is not None:
+            parser["DEFAULT"]["ESCALATION_AFTER_MINUTES"] = str(escalation_after_minutes)
+        return parser
+
+    def test_escalation_threshold_defaults_to_five_hours(self):
+        self.assertEqual(300, run.get_escalation_after_minutes(self.make_parser()))
+
+    def test_escalation_threshold_can_be_configured(self):
+        self.assertEqual(60, run.get_escalation_after_minutes(self.make_parser(60)))
+
+    def test_invalid_escalation_threshold_uses_default(self):
+        self.assertEqual(
+            300, run.get_escalation_after_minutes(self.make_parser("not-a-number"))
+        )
+
+    def test_alerts_go_to_alerts_email_before_threshold(self):
+        recipient, threshold = run.get_alert_recipient(self.make_parser(), 299)
+
+        self.assertEqual("alerts@example.com", recipient)
+        self.assertEqual(300, threshold)
+
+    def test_alerts_go_to_escalation_email_at_threshold(self):
+        recipient, threshold = run.get_alert_recipient(self.make_parser(), 300)
+
+        self.assertEqual("escalation@example.com", recipient)
+        self.assertEqual(300, threshold)
+
+    def test_configured_threshold_controls_escalation_boundary(self):
+        parser = self.make_parser(60)
+
+        before_recipient, before_threshold = run.get_alert_recipient(parser, 59)
+        at_recipient, at_threshold = run.get_alert_recipient(parser, 60)
+
+        self.assertEqual("alerts@example.com", before_recipient)
+        self.assertEqual(60, before_threshold)
+        self.assertEqual("escalation@example.com", at_recipient)
+        self.assertEqual(60, at_threshold)
+
+    def test_force_email_uses_alerts_email_even_after_escalation_threshold(self):
+        recipient, threshold = run.get_alert_recipient(
+            self.make_parser(), 999, force_email=True
+        )
+
+        self.assertEqual("alerts@example.com", recipient)
+        self.assertEqual(300, threshold)
+
+
+class CliParsingTests(unittest.TestCase):
+    def test_parse_args_supports_safe_testing_flags(self):
+        args = run.parse_args(
+            ["--dry-run", "--force-email", "--force-certificate-check", "--log-level", "DEBUG"]
+        )
+
+        self.assertTrue(args.dry_run)
+        self.assertTrue(args.force_email)
+        self.assertTrue(args.force_certificate_check)
+        self.assertEqual("DEBUG", args.log_level)
+
+    def test_manual_text_documents_common_usage(self):
+        manual = run.get_manual_text()
+
+        self.assertIn("PythonMonitorScript manual", manual)
+        self.assertIn("python run.py --dry-run --force-email", manual)
+        self.assertIn("MAILGUN_PRIVATE_KEY", manual)
+        self.assertIn("Forced heartbeat emails use ALERTS_EMAIL", manual)
+        self.assertIn("Certificate behavior", manual)
+
+    def test_missing_dependency_detection_includes_selenium_only_for_screenshots(self):
+        original_requests = run.requests
+        original_aiohttp = run.aiohttp
+        original_proxy = run.CIMultiDictProxy
+        original_webdriver = run.webdriver
+        run.requests = None
+        run.aiohttp = None
+        run.CIMultiDictProxy = ()
+        run.webdriver = None
+        self.addCleanup(setattr, run, "requests", original_requests)
+        self.addCleanup(setattr, run, "aiohttp", original_aiohttp)
+        self.addCleanup(setattr, run, "CIMultiDictProxy", original_proxy)
+        self.addCleanup(setattr, run, "webdriver", original_webdriver)
+
+        without_screenshots = run.get_missing_dependencies(screenshots_enabled=False)
+        with_screenshots = run.get_missing_dependencies(screenshots_enabled=True)
+
+        self.assertIn("requests", without_screenshots)
+        self.assertIn("aiohttp", without_screenshots)
+        self.assertIn("multidict", without_screenshots)
+        self.assertNotIn("selenium", without_screenshots)
+        self.assertIn("selenium", with_screenshots)
+
+
 class EmailMarkupTests(unittest.TestCase):
     def setUp(self):
         self.original_screenshots_enabled = getattr(run, "SCREENSHOTS_ENABLED", False)
@@ -211,6 +328,61 @@ class EmailMarkupTests(unittest.TestCase):
         self.assertIn("&lt;bad cert&gt;", markup)
         self.assertNotIn("<example.com>", markup)
         self.assertNotIn("<bad cert>", markup)
+
+    def test_render_email_template_separates_current_and_cumulative_failures(self):
+        html = run.render_email_template(
+            "<strong>Endpoint:</strong> /id.txt<br>",
+            current_failure_count=2,
+            incident_observations=18,
+            incident_start_timestamp_delta="8m 7s",
+            incident_start_timestamp="2026-06-06T17:29:25+00:00",
+        )
+
+        self.assertIn("Current failing checks: 2", html)
+        self.assertIn("Incident observations: 18", html)
+        self.assertIn("<strong>Endpoint:</strong> /id.txt<br>", html)
+        self.assertNotIn("{{current_failure_count}}", html)
+        self.assertNotIn("{{incident_observations}}", html)
+
+    def test_send_urgent_email_dry_run_does_not_post_to_mailgun(self):
+        original_dry_run = run.DRY_RUN
+        original_post = getattr(run.requests, "post", None)
+        run.DRY_RUN = True
+        run.requests.post = lambda *args, **kwargs: self.fail("Mailgun post should not run")
+
+        self.addCleanup(setattr, run, "DRY_RUN", original_dry_run)
+        if original_post is None:
+            self.addCleanup(delattr, run.requests, "post")
+        else:
+            self.addCleanup(setattr, run.requests, "post", original_post)
+
+        response = run.send_urgent_email(
+            "body",
+            current_failure_count=1,
+            incident_start_timestamp_delta="0m 0s",
+            incident_start_timestamp="2026-06-06T17:29:25+00:00",
+            to_address="admin@example.com",
+            incident_observations=3,
+        )
+
+        self.assertIsNone(response)
+
+    def test_dry_run_skips_response_body_artifact(self):
+        original_dry_run = run.DRY_RUN
+        run.DRY_RUN = True
+        self.addCleanup(setattr, run, "DRY_RUN", original_dry_run)
+
+        self.assertIsNone(run.save_html_to_file("nonce", "<html></html>"))
+
+    def test_dry_run_skips_screenshot_even_without_browser(self):
+        original_dry_run = run.DRY_RUN
+        original_browser = run.BROWSER
+        run.DRY_RUN = True
+        run.BROWSER = None
+        self.addCleanup(setattr, run, "DRY_RUN", original_dry_run)
+        self.addCleanup(setattr, run, "BROWSER", original_browser)
+
+        run.take_endpoint_screenshot("nonce", "https://example.com")
 
 
 if __name__ == "__main__":

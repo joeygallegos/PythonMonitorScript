@@ -4,6 +4,35 @@ This was created so I could make sure certain websites are online and reactively
 
 I have this running in a Linux server running Ubuntu, on a cronjob which runs every 1 minute. The endpoint scanning is asynchronous to complete as fast as possible.
 
+### Usage
+Run the monitor normally:
+
+```bash
+python run.py
+```
+
+Show the built-in manual:
+
+```bash
+python run.py --manual
+```
+
+Useful testing flags:
+
+- `--dry-run` runs checks without writing `tracking.json`, creating response artifacts, or sending Mailgun email.
+- `--force-email` sends an alert to `ALERTS_EMAIL` whenever current heartbeat failures exist, bypassing the normal email cadence and escalation routing.
+- `--force-certificate-check` runs certificate checks even if they already ran today.
+- `--show-headers` includes response headers and body content in heartbeat alert emails.
+- `--take-screenshot` captures Selenium screenshots for failed checks when screenshots are enabled in `config.ini`.
+- `--log-level DEBUG|INFO|WARNING|ERROR` controls console log verbosity.
+
+### Email escalation
+Heartbeat alert emails go to `ALERTS_EMAIL` first. If the same incident remains unresolved for `ESCALATION_AFTER_MINUTES`, future heartbeat alert emails go to `ESCALATION_EMAIL`.
+
+`ESCALATION_AFTER_MINUTES` is optional in `config.ini` and defaults to `300` minutes.
+
+Manual test sends with `--force-email` always go to `ALERTS_EMAIL` so escalation recipients are not notified during testing.
+
 ### Certificate monitoring
 The script also checks HTTPS certificate expiration for every domain in `sites.json` where `check` is set to `true`.
 
