@@ -51,6 +51,7 @@ SCREENSHOTS = []
 SHOW_HEADERS = "--show-headers" in sys.argv
 TAKE_SCREENSHOT = "--take-screenshot" in sys.argv
 CERTIFICATE_EXPIRY_WARNING_DAYS = 10
+DISABLED_SITE_REMINDER_INTERVAL_MINUTES = 360
 # Heartbeat escalation is intentionally much slower than normal alerting.
 # ALERTS_EMAIL gets the early/noisy notifications first, then an unresolved
 # incident moves to ESCALATION_EMAIL after this many minutes unless config.ini
@@ -282,6 +283,7 @@ def load_tracking():
             "failures_total": 0,
             "certificate_last_checked_date": None,
             "certificate_last_alerted_date": None,
+            "disabled_site_tracking": {},
         }
 
     try:
@@ -361,6 +363,7 @@ def update_incident_tracking(alert_count: int):
             "certificate_last_alerted_date": tracking.get(
                 "certificate_last_alerted_date"
             ),
+            "disabled_site_tracking": tracking.get("disabled_site_tracking", {}),
         }
         save_tracking(tracking)
         return tracking
@@ -588,6 +591,110 @@ def update_certificate_tracking(checked_date, alerted=False):
         tracking["certificate_last_alerted_date"] = checked_date
     save_tracking(tracking)
     return tracking
+
+
+def parse_tracking_timestamp(timestamp):
+    return datetime.fromisoformat(timestamp).astimezone(timezone.utc)
+
+
+def elapsed_minutes(start_timestamp, end_time):
+    start_time = parse_tracking_timestamp(start_timestamp)
+    return int((end_time - start_time).total_seconds() // 60)
+
+
+def format_duration_minutes(duration_minutes):
+    hours, minutes = divmod(max(0, int(duration_minutes)), 60)
+    return f"{hours}h {minutes}m"
+
+
+def get_disabled_site_names(sites):
+    return sorted(
+        site
+        for site, site_config in sites.get("sites", {}).items()
+        if site_config.get("check") is False
+    )
+
+
+def update_disabled_site_tracking(sites, now=None):
+    # Disabled monitoring is a config state, not an endpoint failure. Track it
+    # independently so operators get reminded when a site is left off without
+    # changing heartbeat incident counts or escalation routing.
+    if now is None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    now_text = now.replace(microsecond=0).isoformat()
+    tracking = load_tracking()
+    previous_disabled_tracking = tracking.get("disabled_site_tracking", {})
+    current_disabled_sites = set(get_disabled_site_names(sites))
+    updated_disabled_tracking = {}
+    reminder_sites = []
+
+    for site in sorted(current_disabled_sites):
+        # Reuse the original first-seen timestamp for duration math. If a site
+        # is re-enabled, it disappears from this map and the next disable starts
+        # a fresh six-hour reminder window.
+        site_tracking = dict(previous_disabled_tracking.get(site, {}))
+        first_seen = site_tracking.get("first_seen_disabled") or now_text
+        last_reminder_sent = site_tracking.get("last_reminder_sent")
+
+        disabled_minutes = elapsed_minutes(first_seen, now)
+        should_remind = disabled_minutes >= DISABLED_SITE_REMINDER_INTERVAL_MINUTES
+        if should_remind and last_reminder_sent:
+            # One consolidated reminder can include multiple disabled sites,
+            # but each site keeps its own last-reminder timestamp so a newly
+            # disabled site does not inherit another site's cadence.
+            minutes_since_reminder = elapsed_minutes(last_reminder_sent, now)
+            should_remind = (
+                minutes_since_reminder >= DISABLED_SITE_REMINDER_INTERVAL_MINUTES
+            )
+
+        if should_remind:
+            last_reminder_sent = now_text
+            reminder_sites.append(
+                {
+                    "site": site,
+                    "first_seen_disabled": first_seen,
+                    "disabled_minutes": disabled_minutes,
+                }
+            )
+
+        updated_disabled_tracking[site] = {
+            "first_seen_disabled": first_seen,
+            "last_seen_disabled": now_text,
+            "last_reminder_sent": last_reminder_sent,
+        }
+
+    # Sites that are re-enabled or removed from sites.json are intentionally
+    # omitted from the rebuilt map, which clears their disabled reminder state.
+    tracking["disabled_site_tracking"] = updated_disabled_tracking
+    save_tracking(tracking)
+    return tracking, reminder_sites
+
+
+def get_disabled_site_email_markup(disabled_sites):
+    html_body = (
+        "Site tracking is disabled for one or more configured sites.<br><br>"
+        "<strong>Affected sites</strong><br>"
+    )
+
+    for disabled_site in disabled_sites:
+        site = html.escape(str(disabled_site["site"]))
+        first_seen = format_incident_start_pretty(
+            str(disabled_site["first_seen_disabled"])
+        )
+        duration = format_duration_minutes(disabled_site["disabled_minutes"])
+
+        html_body += f"<span style='color: #dc818f;'>Monitoring disabled for {site}</span><br>"
+        html_body += f"<strong>Site:</strong> {site}<br>"
+        html_body += f"<strong>First observed disabled:</strong> {first_seen}<br>"
+        html_body += f"<strong>Disabled duration:</strong> {duration}<br><br>"
+
+    html_body += (
+        "<strong>Action required</strong><br>"
+        "Set <strong>&quot;check&quot;: true</strong> for each affected site in sites.json "
+        "to resume monitoring.<br>"
+    )
+    return html_body
 
 
 def should_send_alert_email(duration_minutes, force_email=False):
@@ -1133,6 +1240,30 @@ if __name__ == "__main__":
             print("✅ Incident has been resolved. Tracking reset.")
         else:
             print("⚠️ ALERTS cleared, but tracking still active. This shouldn't happen.")
+
+    tracking_info, disabled_site_reminders = update_disabled_site_tracking(websites)
+    if disabled_site_reminders:
+        # Send one email for all sites that are currently due. The shared email
+        # template expects one incident start/duration, so use the oldest start
+        # and longest duration as the summary values while the body lists each
+        # affected site with its own duration.
+        oldest_disabled_site = min(
+            disabled_site_reminders, key=lambda item: item["first_seen_disabled"]
+        )
+        longest_disabled_minutes = max(
+            item["disabled_minutes"] for item in disabled_site_reminders
+        )
+        print(
+            f"📧 Sending disabled monitoring reminder for {len(disabled_site_reminders)} site(s)..."
+        )
+        send_urgent_email(
+            get_disabled_site_email_markup(disabled_site_reminders),
+            len(disabled_site_reminders),
+            format_duration_minutes(longest_disabled_minutes),
+            oldest_disabled_site["first_seen_disabled"],
+            PARSER.get("DEFAULT", "ALERTS_EMAIL"),
+            subject="MONITORING DISABLED REMINDER - PythonMonitorScript",
+        )
 
     tracking_info = load_tracking()
     today = utc_today_str()

@@ -33,6 +33,11 @@ Heartbeat alert emails go to `ALERTS_EMAIL` first. If the same incident remains 
 
 Manual test sends with `--force-email` always go to `ALERTS_EMAIL` so escalation recipients are not notified during testing.
 
+### Disabled site reminders
+Sites with `"check": false` are intentionally skipped by heartbeat and certificate monitoring. If a site remains disabled for 6 hours, the script sends one consolidated reminder email to `ALERTS_EMAIL` identifying the disabled site or sites.
+
+Disabled-site reminders repeat every 6 hours while monitoring remains disabled. Set `"check": true` in `sites.json` to resume monitoring and clear the reminder state for that site.
+
 ### Certificate monitoring
 The script also checks HTTPS certificate expiration for every domain in `sites.json` where `check` is set to `true` and `scheme` is `https`.
 

@@ -230,6 +230,220 @@ class IncidentTrackingTests(unittest.TestCase):
         run.save_tracking = lambda data: saved_state.update(copy.deepcopy(data))
 
 
+class DisabledSiteTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.original_print = run.print if hasattr(run, "print") else print
+        run.print = lambda *args, **kwargs: None
+        self.addCleanup(setattr, run, "print", self.original_print)
+        self.now = datetime(2026, 6, 6, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_update_disabled_site_tracking_starts_newly_disabled_site(self):
+        saved_state = {}
+        self.patch_tracking_io({"disabled_site_tracking": {}}, saved_state)
+
+        updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": False}), self.now
+        )
+
+        self.assertEqual([], reminders)
+        self.assertEqual(
+            "2026-06-06T12:00:00+00:00",
+            updated["disabled_site_tracking"]["example.com"]["first_seen_disabled"],
+        )
+        self.assertEqual(updated, saved_state)
+
+    def test_disabled_site_tracking_does_not_remind_before_six_hours(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "example.com": {
+                        "first_seen_disabled": "2026-06-06T06:01:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": None,
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        _updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": False}), self.now
+        )
+
+        self.assertEqual([], reminders)
+        self.assertIsNone(
+            saved_state["disabled_site_tracking"]["example.com"]["last_reminder_sent"]
+        )
+
+    def test_disabled_site_tracking_reminds_at_six_hours(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "example.com": {
+                        "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": None,
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        _updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": False}), self.now
+        )
+
+        self.assertEqual(1, len(reminders))
+        self.assertEqual("example.com", reminders[0]["site"])
+        self.assertEqual(360, reminders[0]["disabled_minutes"])
+        self.assertEqual(
+            "2026-06-06T12:00:00+00:00",
+            saved_state["disabled_site_tracking"]["example.com"]["last_reminder_sent"],
+        )
+
+    def test_disabled_site_tracking_waits_six_hours_between_reminders(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "example.com": {
+                        "first_seen_disabled": "2026-06-06T00:00:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": "2026-06-06T06:01:00+00:00",
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        _updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": False}), self.now
+        )
+
+        self.assertEqual([], reminders)
+        self.assertEqual(
+            "2026-06-06T06:01:00+00:00",
+            saved_state["disabled_site_tracking"]["example.com"]["last_reminder_sent"],
+        )
+
+    def test_disabled_site_tracking_repeats_after_another_six_hours(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "example.com": {
+                        "first_seen_disabled": "2026-06-06T00:00:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": "2026-06-06T06:00:00+00:00",
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        _updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": False}), self.now
+        )
+
+        self.assertEqual(1, len(reminders))
+        self.assertEqual("example.com", reminders[0]["site"])
+        self.assertEqual(
+            "2026-06-06T12:00:00+00:00",
+            saved_state["disabled_site_tracking"]["example.com"]["last_reminder_sent"],
+        )
+
+    def test_disabled_site_tracking_clears_reenabled_sites(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "example.com": {
+                        "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": None,
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": True}), self.now
+        )
+
+        self.assertEqual([], reminders)
+        self.assertEqual({}, updated["disabled_site_tracking"])
+        self.assertEqual({}, saved_state["disabled_site_tracking"])
+
+    def test_disabled_site_tracking_removes_sites_no_longer_configured(self):
+        saved_state = {}
+        self.patch_tracking_io(
+            {
+                "disabled_site_tracking": {
+                    "removed.example": {
+                        "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                        "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                        "last_reminder_sent": None,
+                    }
+                }
+            },
+            saved_state,
+        )
+
+        updated, reminders = run.update_disabled_site_tracking(
+            self.make_sites({"example.com": True}), self.now
+        )
+
+        self.assertEqual([], reminders)
+        self.assertEqual({}, updated["disabled_site_tracking"])
+        self.assertEqual({}, saved_state["disabled_site_tracking"])
+
+    def test_update_incident_tracking_reset_preserves_disabled_site_tracking(self):
+        original_state = {
+            "incident_active": True,
+            "incident_start": "2026-06-06T10:00:00+00:00",
+            "incident_last_seen": "2026-06-06T10:05:00+00:00",
+            "incident_duration": "5m 0s",
+            "failures_total": 3,
+            "disabled_site_tracking": {
+                "example.com": {
+                    "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                    "last_seen_disabled": "2026-06-06T11:59:00+00:00",
+                    "last_reminder_sent": None,
+                }
+            },
+        }
+        saved_state = {}
+        self.patch_tracking_io(original_state, saved_state)
+
+        updated = run.update_incident_tracking(0)
+
+        self.assertEqual(
+            original_state["disabled_site_tracking"],
+            updated["disabled_site_tracking"],
+        )
+        self.assertEqual(updated, saved_state)
+
+    def make_sites(self, checks_by_site):
+        return {
+            "sites": {
+                site: {
+                    "check": should_check,
+                    "endpoints": {"/": {"status": 200, "dom_contains": ""}},
+                }
+                for site, should_check in checks_by_site.items()
+            }
+        }
+
+    def patch_tracking_io(self, original_state, saved_state):
+        self.addCleanup(setattr, run, "load_tracking", run.load_tracking)
+        self.addCleanup(setattr, run, "save_tracking", run.save_tracking)
+        run.load_tracking = lambda: copy.deepcopy(original_state)
+        run.save_tracking = lambda data: saved_state.update(copy.deepcopy(data))
+
+
 class AlertCadenceTests(unittest.TestCase):
     def test_alert_email_cadence_suppresses_short_incidents(self):
         self.assertFalse(run.should_send_alert_email(0))
@@ -384,6 +598,36 @@ class EmailMarkupTests(unittest.TestCase):
         self.assertIn("&lt;bad cert&gt;", markup)
         self.assertNotIn("<example.com>", markup)
         self.assertNotIn("<bad cert>", markup)
+
+    def test_disabled_site_email_markup_identifies_site_duration_and_action(self):
+        markup = run.get_disabled_site_email_markup(
+            [
+                {
+                    "site": "example.com",
+                    "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                    "disabled_minutes": 360,
+                }
+            ]
+        )
+
+        self.assertIn("Site tracking is disabled", markup)
+        self.assertIn("Monitoring disabled for example.com", markup)
+        self.assertIn("Disabled duration:</strong> 6h 0m", markup)
+        self.assertIn("&quot;check&quot;: true", markup)
+
+    def test_disabled_site_email_markup_escapes_site_names(self):
+        markup = run.get_disabled_site_email_markup(
+            [
+                {
+                    "site": "<example.com>",
+                    "first_seen_disabled": "2026-06-06T06:00:00+00:00",
+                    "disabled_minutes": 360,
+                }
+            ]
+        )
+
+        self.assertIn("&lt;example.com&gt;", markup)
+        self.assertNotIn("<example.com>", markup)
 
     def test_render_email_template_separates_current_and_cumulative_failures(self):
         html = run.render_email_template(
