@@ -11,6 +11,7 @@ import time
 import uuid
 import asyncio
 import sys
+import secrets
 from math import ceil
 from datetime import datetime, timezone
 
@@ -38,6 +39,11 @@ try:
 except ImportError:
     webdriver = None
 
+try:
+    import dns.resolver as dns_resolver
+except ImportError:
+    dns_resolver = None
+
 scriptdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(scriptdir)
 
@@ -52,6 +58,12 @@ SHOW_HEADERS = "--show-headers" in sys.argv
 TAKE_SCREENSHOT = "--take-screenshot" in sys.argv
 CERTIFICATE_EXPIRY_WARNING_DAYS = 10
 DISABLED_SITE_REMINDER_INTERVAL_MINUTES = 360
+DNS_BASELINE_FILENAME = "dns-baseline.json"
+SUPPORTED_DNS_RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS")
+# Parent-domain inheritance skips CNAME because apex CNAME records are uncommon
+# and often invalid. Operators can still request CNAME explicitly for names
+# such as www.example.com via dns_records.
+INHERITED_DNS_RECORD_TYPES = ("A", "AAAA", "MX", "TXT", "NS")
 # Heartbeat escalation is intentionally much slower than normal alerting.
 # ALERTS_EMAIL gets the early/noisy notifications first, then an unresolved
 # incident moves to ESCALATION_EMAIL after this many minutes unless config.ini
@@ -79,6 +91,13 @@ def parse_args(argv=None):
   python run.py --force-certificate-check
       Run the daily certificate pass even if it already ran today.
 
+  python run.py dns-scan
+      Compare current DNS records to dns-baseline.json and print variances.
+
+  python run.py dns-baseline
+      Resolve current DNS records and prompt for confirmation before writing
+      dns-baseline.json.
+
 Required config.ini keys:
   MAILGUN_PRIVATE_KEY, MAILGUN_DOMAIN, MAILGUN_FROM, ALERTS_EMAIL,
   ESCALATION_EMAIL, SCREENSHOTS_ENABLED, TMP_PATH_SCREENSHOTS, DEBUG
@@ -88,6 +107,13 @@ Optional config.ini keys:
 
 Sites are configured in sites.json. Domains with "check": true are checked.
 """,
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="monitor",
+        choices=["monitor", "dns-scan", "dns-baseline"],
+        help="Run the normal monitor or a DNS baseline command.",
     )
     parser.add_argument(
         "--manual",
@@ -161,6 +187,16 @@ Testing usage
   python run.py --force-certificate-check
       Run certificate checks even when certificate_last_checked_date is today.
 
+  python run.py dns-scan
+      Resolve configured DNS records and compare them to dns-baseline.json.
+      Prints missing, new, changed, and resolver-error variances. Exits 1 when
+      variances exist.
+
+  python run.py dns-baseline
+      Resolve configured DNS records, print the would-be baseline and a
+      generated 6-character confirmation code, then write dns-baseline.json
+      only when the operator types the exact code at the prompt.
+
 Debug options
   --show-headers
       Include response headers and body content in heartbeat alert emails.
@@ -182,10 +218,16 @@ Config files
 
   sites.json
       Domains, optional scheme ("https" by default, or "http"), endpoint paths,
-      expected status codes, and optional DOM strings.
+      expected status codes, optional DOM strings, and optional dns_records
+      entries for DNS baseline scanning.
 
   tracking.json
       Persistent incident state and daily certificate scheduling state.
+
+DNS baseline behavior
+  DNS baseline commands support A, AAAA, CNAME, MX, TXT, and NS records.
+  dns-scan compares current DNS answers to dns-baseline.json. dns-baseline
+  replaces that file after interactive confirmation.
 
 Email behavior
   Heartbeat emails are suppressed for the first 5 minutes of an incident.
@@ -206,7 +248,7 @@ def setup_logging(level="INFO"):
     )
 
 
-def get_missing_dependencies(screenshots_enabled=False):
+def get_missing_dependencies(screenshots_enabled=False, dns_enabled=False):
     # Keep --manual usable even before dependencies are installed, but fail
     # clearly before running monitor work that needs those packages.
     missing = []
@@ -218,6 +260,8 @@ def get_missing_dependencies(screenshots_enabled=False):
         missing.append("multidict")
     if screenshots_enabled and webdriver is None:
         missing.append("selenium")
+    if dns_enabled and dns_resolver is None:
+        missing.append("dnspython")
     return missing
 
 
@@ -374,6 +418,306 @@ def get_website_dictionary():
     sites_config_file = open(os.path.join(scriptdir, "sites.json"))
     sites_to_monitor = json.load(sites_config_file)
     return sites_to_monitor
+
+
+def get_dns_baseline_path():
+    return os.path.join(scriptdir, DNS_BASELINE_FILENAME)
+
+
+def load_dns_baseline():
+    path = get_dns_baseline_path()
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as baseline_file:
+        return json.load(baseline_file)
+
+
+def save_dns_baseline(baseline):
+    path = get_dns_baseline_path()
+    with open(path, "w", encoding="utf-8") as baseline_file:
+        json.dump(baseline, baseline_file, indent=2)
+        baseline_file.write("\n")
+
+
+def normalize_dns_name(value):
+    text = str(value).strip().lower()
+    if not text:
+        return text
+    return text if text.endswith(".") else text + "."
+
+
+def normalize_dns_text(value):
+    return str(value).strip()
+
+
+def normalize_dns_record_value(record_type, value):
+    # Store records in the same shape operators usually see them in DNS tools:
+    # fully qualified names end with a dot, MX includes priority, TXT chunks are
+    # joined into the published string, and address records remain plain IPs.
+    record_type = str(record_type).upper()
+    if record_type in ("CNAME", "NS"):
+        return normalize_dns_name(value)
+    if record_type in ("A", "AAAA"):
+        return normalize_dns_text(value)
+    if record_type == "TXT":
+        if hasattr(value, "strings"):
+            parts = []
+            for part in value.strings:
+                if isinstance(part, bytes):
+                    parts.append(part.decode("utf-8", errors="replace"))
+                else:
+                    parts.append(str(part))
+            return "".join(parts)
+        return normalize_dns_text(value).strip('"')
+    if record_type == "MX":
+        if hasattr(value, "preference") and hasattr(value, "exchange"):
+            return f"{int(value.preference)} {normalize_dns_name(value.exchange)}"
+        parts = normalize_dns_text(value).split(maxsplit=1)
+        if len(parts) == 2 and parts[0].isdigit():
+            return f"{int(parts[0])} {normalize_dns_name(parts[1])}"
+        return normalize_dns_text(value)
+    return normalize_dns_text(value)
+
+
+def get_configured_dns_records(sites):
+    # DNS baseline commands follow the same site-level enable switch as uptime
+    # checks. That keeps "check": false as the single way to pause monitoring
+    # work for a site.
+    records = []
+    for site, site_config in sites.get("sites", {}).items():
+        if site_config.get("check") is not True:
+            continue
+        configured_records = site_config.get("dns_records")
+        if not configured_records:
+            # With no per-site DNS config, baseline commands use the site key
+            # itself as the DNS name. This keeps sites.json concise for the
+            # common case where the domain being monitored is also the DNS
+            # parent domain the operator wants baselined.
+            configured_records = [
+                {"name": site, "type": record_type}
+                for record_type in INHERITED_DNS_RECORD_TYPES
+            ]
+
+        for record in configured_records:
+            record_type = str(record.get("type", "")).upper().strip()
+            records.append(
+                {
+                    "site": site,
+                    "name": str(record.get("name", site)).strip(),
+                    "type": record_type,
+                }
+            )
+    return records
+
+
+def get_dns_record_key(record):
+    # Baseline comparisons are keyed by configured identity, not by resolved
+    # values, so value changes show up as drift instead of a delete plus add.
+    return "|".join(
+        [
+            str(record["site"]).lower(),
+            str(record["type"]).upper(),
+            normalize_dns_name(record["name"]),
+        ]
+    )
+
+
+def resolve_dns_record(record, resolver=None):
+    record_type = str(record["type"]).upper()
+    if record_type not in SUPPORTED_DNS_RECORD_TYPES:
+        raise ValueError(f"Unsupported DNS record type: {record_type}")
+    if resolver is None:
+        if dns_resolver is None:
+            raise RuntimeError("dnspython is required for DNS commands")
+        resolver = dns_resolver.resolve
+
+    answers = resolver(record["name"], record_type, lifetime=5)
+    return sorted(
+        {
+            normalize_dns_record_value(record_type, answer)
+            for answer in answers
+        }
+    )
+
+
+def is_dns_no_answer(exception):
+    return (
+        dns_resolver is not None
+        and hasattr(dns_resolver, "NoAnswer")
+        and isinstance(exception, dns_resolver.NoAnswer)
+    )
+
+
+def build_dns_scan_document(sites, resolver=None, generated_at=None):
+    # Keep resolver failures in the scan document so dns-scan can report all
+    # variances in one pass. One broken record should not hide other DNS drift.
+    if generated_at is None:
+        generated_at = now_iso()
+
+    scan_records = []
+    for record in get_configured_dns_records(sites):
+        result = {
+            "site": record["site"],
+            "name": record["name"],
+            "type": record["type"],
+            "values": [],
+            "error": None,
+        }
+        try:
+            result["values"] = resolve_dns_record(record, resolver)
+        except Exception as ex:
+            if is_dns_no_answer(ex):
+                result["values"] = []
+            else:
+                result["error"] = str(ex) or repr(ex)
+        scan_records.append(result)
+
+    scan_records.sort(key=get_dns_record_key)
+    return {
+        "generated_at": generated_at,
+        "records": scan_records,
+    }
+
+
+def index_dns_records(scan_document):
+    return {
+        get_dns_record_key(record): record
+        for record in scan_document.get("records", [])
+    }
+
+
+def compare_dns_scan_to_baseline(current_scan, baseline):
+    variances = []
+    if baseline is None:
+        return [
+            {
+                "kind": "missing_baseline",
+                "message": f"{DNS_BASELINE_FILENAME} does not exist",
+            }
+        ]
+
+    current_records = index_dns_records(current_scan)
+    baseline_records = index_dns_records(baseline)
+
+    for key in sorted(set(baseline_records) - set(current_records)):
+        baseline_record = baseline_records[key]
+        variances.append(
+            {
+                "kind": "missing_record",
+                "record": baseline_record,
+                "message": "Record was present in baseline but is not configured in the current scan",
+            }
+        )
+
+    for key in sorted(set(current_records) - set(baseline_records)):
+        current_record = current_records[key]
+        variances.append(
+            {
+                "kind": "new_record",
+                "record": current_record,
+                "message": "Record is configured in the current scan but is missing from the baseline",
+            }
+        )
+
+    for key in sorted(set(current_records) & set(baseline_records)):
+        current_record = current_records[key]
+        baseline_record = baseline_records[key]
+        if current_record.get("error"):
+            # Resolver errors are actionable drift from an operator perspective:
+            # the baseline says the record should be observable, but the current
+            # lookup could not produce values to compare.
+            variances.append(
+                {
+                    "kind": "resolver_error",
+                    "record": current_record,
+                    "message": current_record["error"],
+                }
+            )
+            continue
+
+        expected_values = set(baseline_record.get("values", []))
+        current_values = set(current_record.get("values", []))
+        missing_values = sorted(expected_values - current_values)
+        new_values = sorted(current_values - expected_values)
+        if missing_values or new_values:
+            variances.append(
+                {
+                    "kind": "changed_values",
+                    "record": current_record,
+                    "missing_values": missing_values,
+                    "new_values": new_values,
+                    "message": "DNS values differ from baseline",
+                }
+            )
+
+    return variances
+
+
+def format_dns_record_label(record):
+    return f"{record['site']} {record['type']} {record['name']}"
+
+
+def print_dns_scan(scan_document):
+    print(json.dumps(scan_document, indent=2))
+
+
+def print_dns_variances(variances):
+    if not variances:
+        print("✅ DNS scan matched baseline. No variances detected.")
+        return
+
+    print(f"❌ DNS variances detected: {len(variances)}")
+    for variance in variances:
+        print(f"- {variance['kind']}: {variance['message']}")
+        record = variance.get("record")
+        if record:
+            print(f"  Record: {format_dns_record_label(record)}")
+            if record.get("values"):
+                print(f"  Current values: {', '.join(record['values'])}")
+        if variance.get("missing_values"):
+            print(f"  Missing values: {', '.join(variance['missing_values'])}")
+        if variance.get("new_values"):
+            print(f"  New values: {', '.join(variance['new_values'])}")
+
+
+def make_confirmation_code():
+    return secrets.token_hex(3).upper()
+
+
+def run_dns_scan_command(sites, resolver=None, baseline=None):
+    current_scan = build_dns_scan_document(sites, resolver)
+    if baseline is None:
+        baseline = load_dns_baseline()
+    variances = compare_dns_scan_to_baseline(current_scan, baseline)
+    print_dns_variances(variances)
+    return 1 if variances else 0
+
+
+def run_dns_baseline_command(
+    sites,
+    resolver=None,
+    input_func=input,
+    confirmation_code=None,
+    save_func=save_dns_baseline,
+):
+    # Baseline replacement is intentionally interactive. The generated code
+    # makes an accidental Enter or pasted command much less likely to rewrite
+    # the approved DNS state.
+    baseline = build_dns_scan_document(sites, resolver)
+    print("Current DNS scan that will become the new baseline:")
+    print_dns_scan(baseline)
+
+    if confirmation_code is None:
+        confirmation_code = make_confirmation_code()
+    print(f"Type this 6-character code to replace {DNS_BASELINE_FILENAME}: {confirmation_code}")
+    entered_code = input_func("Confirmation code: ").strip()
+    if entered_code != confirmation_code:
+        print("Confirmation failed. DNS baseline was not changed.")
+        return 1
+
+    save_func(baseline)
+    print(f"✅ Wrote {DNS_BASELINE_FILENAME}")
+    return 0
 
 
 def get_site_scheme(site_config):
@@ -1150,6 +1494,20 @@ if __name__ == "__main__":
     DRY_RUN = args.dry_run
     FORCE_EMAIL = args.force_email
     FORCE_CERTIFICATE_CHECK = args.force_certificate_check
+
+    if args.command in ("dns-scan", "dns-baseline"):
+        missing_dependencies = get_missing_dependencies(dns_enabled=True)
+        if missing_dependencies:
+            LOGGER.error(
+                "Missing required Python packages: %s. Install with: pip install -r requirements.txt",
+                ", ".join(missing_dependencies),
+            )
+            sys.exit(1)
+
+        websites = get_website_dictionary()
+        if args.command == "dns-scan":
+            sys.exit(run_dns_scan_command(websites))
+        sys.exit(run_dns_baseline_command(websites))
 
     LOGGER.info("Reading data from config.ini")
     PARSER.read("config.ini")

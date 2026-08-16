@@ -17,6 +17,59 @@ Show the built-in manual:
 python run.py --manual
 ```
 
+### DNS baseline scanning
+DNS baseline commands compare current DNS answers to a cached `dns-baseline.json` file. Enabled sites inherit DNS checks from their parent `sites.json` domain when `dns_records` is omitted. For example, a site key of `example.com` checks `A`, `AAAA`, `MX`, `TXT`, and `NS` records for `example.com`.
+
+Add `dns_records` only when you want to check a specific name or record type:
+
+```json
+{
+  "sites": {
+    "example.com": {
+      "check": true,
+      "endpoints": {
+        "/": {
+          "status": 200,
+          "dom_contains": ""
+        }
+      },
+      "dns_records": [
+        {
+          "name": "example.com",
+          "type": "A"
+        },
+        {
+          "name": "example.com",
+          "type": "MX"
+        },
+        {
+          "name": "www.example.com",
+          "type": "CNAME"
+        }
+      ]
+    }
+  }
+}
+```
+
+Supported DNS record types are `A`, `AAAA`, `CNAME`, `MX`, `TXT`, and `NS`. Individual `dns_records` entries inherit the parent site domain when `name` is omitted. Inherited parent-domain checks use `A`, `AAAA`, `MX`, `TXT`, and `NS`; no-answer responses are stored as empty value sets. Disabled sites with `"check": false` are skipped.
+
+Create or replace the baseline from current DNS answers:
+
+```bash
+python run.py dns-baseline
+```
+
+The command prints the would-be baseline and a 6-character confirmation code. Type the exact code at the prompt to write `dns-baseline.json`.
+
+Check current DNS against the saved baseline:
+
+```bash
+python run.py dns-scan
+```
+
+`dns-scan` prints variances for a missing baseline file, records missing from the current scan, newly configured records not in the baseline, changed record values, and resolver errors. It exits with status code `1` when variances are found and `0` when current DNS matches the baseline.
+
 Useful testing flags:
 
 - `--dry-run` runs checks without writing `tracking.json`, creating response artifacts, or sending Mailgun email.

@@ -152,6 +152,274 @@ class SiteSchemeTests(unittest.TestCase):
         self.assertEqual([], run.do_certificate_checks(sites))
 
 
+class DnsBaselineTests(unittest.TestCase):
+    def setUp(self):
+        self.original_print = run.print if hasattr(run, "print") else print
+        run.print = lambda *args, **kwargs: None
+        self.addCleanup(setattr, run, "print", self.original_print)
+
+    def make_sites(self, records=None, check=True):
+        site_config = {
+            "check": check,
+            "endpoints": {"/": {"status": 200, "dom_contains": ""}},
+        }
+        if records is not None:
+            site_config["dns_records"] = records
+
+        return {
+            "sites": {
+                "example.com": site_config
+            }
+        }
+
+    def test_parse_args_supports_dns_subcommands(self):
+        self.assertEqual("monitor", run.parse_args([]).command)
+        self.assertEqual("dns-scan", run.parse_args(["dns-scan"]).command)
+        self.assertEqual("dns-baseline", run.parse_args(["dns-baseline"]).command)
+
+    def test_dns_normalization_supports_common_record_types(self):
+        mx_value = SimpleNamespace(preference=10, exchange="Mail.Example.COM")
+        txt_value = SimpleNamespace(strings=[b"v=spf1 ", b"include:_spf.example.com"])
+
+        self.assertEqual(
+            "example.com.", run.normalize_dns_record_value("CNAME", "Example.COM")
+        )
+        self.assertEqual("ns1.example.com.", run.normalize_dns_record_value("NS", "NS1.Example.COM."))
+        self.assertEqual("192.0.2.1", run.normalize_dns_record_value("A", "192.0.2.1"))
+        self.assertEqual("2001:db8::1", run.normalize_dns_record_value("AAAA", "2001:db8::1"))
+        self.assertEqual("10 mail.example.com.", run.normalize_dns_record_value("MX", mx_value))
+        self.assertEqual(
+            "v=spf1 include:_spf.example.com",
+            run.normalize_dns_record_value("TXT", txt_value),
+        )
+
+    def test_build_dns_scan_document_resolves_enabled_configured_records(self):
+        def resolver(name, record_type, lifetime=5):
+            self.assertEqual("example.com", name)
+            self.assertEqual("A", record_type)
+            self.assertEqual(5, lifetime)
+            return ["192.0.2.1"]
+
+        scan = run.build_dns_scan_document(
+            self.make_sites([{"name": "example.com", "type": "A"}]),
+            resolver,
+            "2026-06-06T12:00:00+00:00",
+        )
+
+        self.assertEqual("2026-06-06T12:00:00+00:00", scan["generated_at"])
+        self.assertEqual(
+            [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.1"],
+                    "error": None,
+                }
+            ],
+            scan["records"],
+        )
+
+    def test_configured_dns_records_inherit_from_parent_site_domain(self):
+        records = run.get_configured_dns_records(self.make_sites())
+
+        self.assertEqual(
+            [
+                {"site": "example.com", "name": "example.com", "type": "A"},
+                {"site": "example.com", "name": "example.com", "type": "AAAA"},
+                {"site": "example.com", "name": "example.com", "type": "MX"},
+                {"site": "example.com", "name": "example.com", "type": "TXT"},
+                {"site": "example.com", "name": "example.com", "type": "NS"},
+            ],
+            records,
+        )
+
+    def test_configured_dns_record_name_defaults_to_parent_site_domain(self):
+        records = run.get_configured_dns_records(
+            self.make_sites([{"type": "TXT"}])
+        )
+
+        self.assertEqual(
+            [{"site": "example.com", "name": "example.com", "type": "TXT"}],
+            records,
+        )
+
+    def test_build_dns_scan_document_skips_disabled_sites(self):
+        scan = run.build_dns_scan_document(
+            self.make_sites(check=False), lambda *_args, **_kwargs: self.fail()
+        )
+
+        self.assertEqual([], scan["records"])
+
+    def test_build_dns_scan_document_treats_no_answer_as_empty_values(self):
+        class FakeNoAnswer(Exception):
+            pass
+
+        original_dns_resolver = run.dns_resolver
+        run.dns_resolver = SimpleNamespace(NoAnswer=FakeNoAnswer)
+        self.addCleanup(setattr, run, "dns_resolver", original_dns_resolver)
+
+        def resolver(_name, _record_type, lifetime=5):
+            raise FakeNoAnswer("no AAAA")
+
+        scan = run.build_dns_scan_document(
+            self.make_sites([{"name": "example.com", "type": "AAAA"}]),
+            resolver,
+            "2026-06-06T12:00:00+00:00",
+        )
+
+        self.assertEqual([], scan["records"][0]["values"])
+        self.assertIsNone(scan["records"][0]["error"])
+
+    def test_compare_dns_scan_to_baseline_detects_no_drift(self):
+        baseline = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.1"],
+                    "error": None,
+                }
+            ]
+        }
+        current = copy.deepcopy(baseline)
+
+        self.assertEqual([], run.compare_dns_scan_to_baseline(current, baseline))
+
+    def test_compare_dns_scan_to_baseline_detects_missing_baseline(self):
+        variances = run.compare_dns_scan_to_baseline({"records": []}, None)
+
+        self.assertEqual("missing_baseline", variances[0]["kind"])
+
+    def test_compare_dns_scan_to_baseline_detects_missing_and_new_records(self):
+        baseline = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.1"],
+                    "error": None,
+                }
+            ]
+        }
+        current = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "MX",
+                    "values": ["10 mail.example.com."],
+                    "error": None,
+                }
+            ]
+        }
+
+        kinds = [
+            variance["kind"]
+            for variance in run.compare_dns_scan_to_baseline(current, baseline)
+        ]
+
+        self.assertEqual(["missing_record", "new_record"], kinds)
+
+    def test_compare_dns_scan_to_baseline_detects_changed_values(self):
+        baseline = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.1"],
+                    "error": None,
+                }
+            ]
+        }
+        current = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.2"],
+                    "error": None,
+                }
+            ]
+        }
+
+        variances = run.compare_dns_scan_to_baseline(current, baseline)
+
+        self.assertEqual("changed_values", variances[0]["kind"])
+        self.assertEqual(["192.0.2.1"], variances[0]["missing_values"])
+        self.assertEqual(["192.0.2.2"], variances[0]["new_values"])
+
+    def test_compare_dns_scan_to_baseline_detects_resolver_errors(self):
+        baseline = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": ["192.0.2.1"],
+                    "error": None,
+                }
+            ]
+        }
+        current = {
+            "records": [
+                {
+                    "site": "example.com",
+                    "name": "example.com",
+                    "type": "A",
+                    "values": [],
+                    "error": "DNS timeout",
+                }
+            ]
+        }
+
+        variances = run.compare_dns_scan_to_baseline(current, baseline)
+
+        self.assertEqual("resolver_error", variances[0]["kind"])
+        self.assertEqual("DNS timeout", variances[0]["message"])
+
+    def test_dns_baseline_command_does_not_write_on_empty_or_wrong_confirmation(self):
+        writes = []
+
+        wrong_exit = run.run_dns_baseline_command(
+            self.make_sites([{"name": "example.com", "type": "A"}]),
+            resolver=lambda *_args, **_kwargs: ["192.0.2.1"],
+            input_func=lambda _prompt: "WRONG",
+            confirmation_code="ABC123",
+            save_func=writes.append,
+        )
+        empty_exit = run.run_dns_baseline_command(
+            self.make_sites([{"name": "example.com", "type": "A"}]),
+            resolver=lambda *_args, **_kwargs: ["192.0.2.1"],
+            input_func=lambda _prompt: "",
+            confirmation_code="ABC123",
+            save_func=writes.append,
+        )
+
+        self.assertEqual(1, wrong_exit)
+        self.assertEqual(1, empty_exit)
+        self.assertEqual([], writes)
+
+    def test_dns_baseline_command_writes_on_matching_confirmation(self):
+        writes = []
+
+        exit_code = run.run_dns_baseline_command(
+            self.make_sites([{"name": "example.com", "type": "A"}]),
+            resolver=lambda *_args, **_kwargs: ["192.0.2.1"],
+            input_func=lambda _prompt: "ABC123",
+            confirmation_code="ABC123",
+            save_func=writes.append,
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(1, len(writes))
+        self.assertEqual(["192.0.2.1"], writes[0]["records"][0]["values"])
+
+
 class IncidentTrackingTests(unittest.TestCase):
     def setUp(self):
         self.original_print = run.print if hasattr(run, "print") else print
@@ -541,23 +809,28 @@ class CliParsingTests(unittest.TestCase):
         original_aiohttp = run.aiohttp
         original_proxy = run.CIMultiDictProxy
         original_webdriver = run.webdriver
+        original_dns_resolver = run.dns_resolver
         run.requests = None
         run.aiohttp = None
         run.CIMultiDictProxy = ()
         run.webdriver = None
+        run.dns_resolver = None
         self.addCleanup(setattr, run, "requests", original_requests)
         self.addCleanup(setattr, run, "aiohttp", original_aiohttp)
         self.addCleanup(setattr, run, "CIMultiDictProxy", original_proxy)
         self.addCleanup(setattr, run, "webdriver", original_webdriver)
+        self.addCleanup(setattr, run, "dns_resolver", original_dns_resolver)
 
         without_screenshots = run.get_missing_dependencies(screenshots_enabled=False)
         with_screenshots = run.get_missing_dependencies(screenshots_enabled=True)
+        with_dns = run.get_missing_dependencies(dns_enabled=True)
 
         self.assertIn("requests", without_screenshots)
         self.assertIn("aiohttp", without_screenshots)
         self.assertIn("multidict", without_screenshots)
         self.assertNotIn("selenium", without_screenshots)
         self.assertIn("selenium", with_screenshots)
+        self.assertIn("dnspython", with_dns)
 
 
 class EmailMarkupTests(unittest.TestCase):

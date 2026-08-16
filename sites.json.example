@@ -22,7 +22,13 @@
                     "status": 200,
                     "dom_contains": ""
                 }
-            }
+            },
+            "dns_records": [
+                {
+                    "name": "localhost",
+                    "type": "A"
+                }
+            ]
         }
     }
 }
